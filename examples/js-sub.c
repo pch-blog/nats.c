@@ -115,6 +115,8 @@ int main(int argc, char **argv)
             cfg.SubjectsLen = 1;
             // Make it a memory stream.
             cfg.Storage = js_MemoryStorage;
+            // Set stream memory size.
+            cfg.MaxBytes = (1024 * 1024) * 64;
             // Add the stream,
             s = js_AddStream(&si, js, &cfg, NULL, &jerr);
         }
