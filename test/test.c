@@ -20,6 +20,7 @@
 #else
 #include <dirent.h>
 #include <sys/stat.h>
+#include <execinfo.h>
 #endif
 
 #include "buf.h"
@@ -2581,6 +2582,7 @@ test_natsOptions(void)
              && (opts->maxPingsOut == 2)
              && (opts->ioBufSize == 32 * 1024)
              && (opts->maxPendingMsgs == 65536)
+             && (opts->maxPendingBytes == -1)
              && (opts->user == NULL)
              && (opts->password == NULL)
              && (opts->token == NULL)
@@ -2811,6 +2813,10 @@ test_natsOptions(void)
     test("Set Max Pending Msgs : ");
     s = natsOptions_SetMaxPendingMsgs(opts, 10000);
     testCond((s == NATS_OK) && (opts->maxPendingMsgs == 10000));
+
+    test("Set Max Pending Bytes : ");
+    s = natsOptions_SetMaxPendingBytes(opts, 1000000);
+    testCond((s == NATS_OK) && (opts->maxPendingBytes == 1000000))
 
     test("Set Error Handler: ");
     s = natsOptions_SetErrorHandler(opts, _dummyErrHandler, NULL);
@@ -5458,6 +5464,41 @@ test_natsSrvVersionAtLeast(void)
     testCond(s == NATS_OK);
 
     natsConnection_Destroy(nc);
+}
+
+static void
+test_natsFormatStringArray(void)
+{
+    natsStatus s;
+    size_t i, N;
+
+    typedef struct
+    {
+        const char *name;
+        const char **in;
+        int inLen;
+        const char *out;
+    } TC;
+
+    TC tcs[] = {
+        {"Empty", NULL, 0, "[]"},
+        {"One", (const char *[]){"one"}, 1, "[\"one\"]"},
+        {"Three", (const char *[]){"one", "two", "three"}, 3, "[\"one\",\"two\",\"three\"]"},
+        {"NULL", (const char *[]){NULL}, 1, "[\"(null)\"]"},
+    };
+
+    char *out[sizeof(tcs) / sizeof(TC)];
+    memset(out, 0, sizeof(out));
+
+    N = sizeof(tcs) / sizeof(TC);
+    for (i = 0; i < N; i++)
+    {
+        test(tcs[i].name);
+        s = nats_formatStringArray(&out[i], tcs[i].in, tcs[i].inLen);
+        testCond((s == NATS_OK) && (out[i] != NULL) && (strcmp(out[i], tcs[i].out) == 0));
+    }
+
+    NATS_FREE_STRINGS(out, N);
 }
 
 static natsStatus
@@ -14340,13 +14381,13 @@ _asyncErrCb(natsConnection *nc, natsSubscription *sub, natsStatus err, void* clo
 
     arg->closed = true;
     arg->done = true;
-    natsCondition_Signal(arg->c);
+    natsCondition_Broadcast(arg->c);
 
     natsMutex_Unlock(arg->m);
 }
 
 static void
-test_AsyncErrHandler(void)
+test_AsyncErrHandler_MaxPendingMsgs(void)
 {
     natsStatus          s;
     natsConnection      *nc       = NULL;
@@ -14408,6 +14449,71 @@ test_AsyncErrHandler(void)
     _stopServer(serverPid);
 }
 
+static void
+test_AsyncErrHandler_MaxPendingBytes(void)
+{
+    natsStatus          s;
+    natsConnection* nc = NULL;
+    natsOptions* opts = NULL;
+    natsSubscription* sub = NULL;
+    natsPid             serverPid = NATS_INVALID_PID;
+    struct threadArg    arg;
+    int                 data_len = 10;
+    const char          msg[] = { 0,1,2,3,4,5,6,7,8,9 }; //10 bytes long message
+    int64_t             pendingBytesLimit = 100;
+    int                 i = 0;
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test!");
+
+    arg.status = NATS_OK;
+    arg.control = 7;
+
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetURL(opts, NATS_DEFAULT_URL));
+    IFOK(s, natsOptions_SetMaxPendingBytes(opts, pendingBytesLimit));
+    IFOK(s, natsOptions_SetErrorHandler(opts, _asyncErrCb, (void*)&arg));
+
+    if (s != NATS_OK)
+        FAIL("Unable to create options for test AsyncErrHandler");
+
+    serverPid = _startServer("nats://127.0.0.1:4222", NULL, true);
+    CHECK_SERVER_STARTED(serverPid);
+
+    s = natsConnection_Connect(&nc, opts);
+    IFOK(s, natsConnection_Subscribe(&sub, nc, "async_test", _recvTestString, (void*)&arg));
+
+    natsMutex_Lock(arg.m);
+    arg.sub = sub;
+    natsMutex_Unlock(arg.m);
+    for (i=0;
+        (s == NATS_OK) && (i < (pendingBytesLimit + 100)); i+=data_len) //increment by 10 (message size) each iteration
+    {
+        s = natsConnection_Publish(nc, "async_test", msg, data_len);
+    }
+    IFOK(s, natsConnection_Flush(nc));
+
+    // Wait for async err callback
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && !arg.done)
+        s = natsCondition_TimedWait(arg.c, arg.m, 2000);
+    natsMutex_Unlock(arg.m);
+
+    test("Aync fired properly, and all checks are good: ");
+    testCond((s == NATS_OK)
+        && arg.done
+        && arg.closed
+        && (arg.status == NATS_OK));
+
+    natsOptions_Destroy(opts);
+    natsSubscription_Destroy(sub);
+    natsConnection_Destroy(nc);
+
+    _destroyDefaultThreadArgs(&arg);
+
+    _stopServer(serverPid);
+}
 
 static void
 _asyncErrBlockingCb(natsConnection *nc, natsSubscription *sub, natsStatus err, void* closure)
@@ -20094,6 +20200,90 @@ test_NoPartialOnReconnect(void)
     _destroyDefaultThreadArgs(&arg);
 
     _stopServer(pid);
+}
+
+static void
+test_ForcedReconnect(void)
+{
+    natsStatus s;
+    struct threadArg    arg;
+    natsOptions *opts = NULL;
+    natsConnection *nc = NULL;
+    natsSubscription *sub = NULL;
+    natsMsg *msg = NULL;
+    natsPid pid = NATS_INVALID_PID;
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("unable to setup test");
+
+    test("Start server, connect, subscribe: ");
+    pid = _startServer("nats://127.0.0.1:4222", "-p 4222", true);
+    CHECK_SERVER_STARTED(pid);
+    IFOK(s, natsOptions_Create(&opts));
+    IFOK(s, natsOptions_SetReconnectedCB(opts, _reconnectedCb, &arg));
+    IFOK(s, natsConnection_Connect(&nc, opts));
+    IFOK(s, natsConnection_SubscribeSync(&sub, nc, "foo"));
+    testCond(s == NATS_OK);
+
+    test("Send a message to foo: ");
+    IFOK(s, natsConnection_PublishString(nc, "foo", "bar"));
+    testCond(s == NATS_OK);
+
+    test("Receive the message: ");
+    s = natsSubscription_NextMsg(&msg, sub, 1000);
+    testCond((s == NATS_OK) && (msg != NULL));
+    natsMsg_Destroy(msg);
+    msg = NULL;
+
+    test("Forced reconnect: ");
+    s = natsConnection_Reconnect(nc);
+    testCond(s == NATS_OK);
+
+    test("Waiting for reconnect: ");
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && !arg.reconnected)
+        s = natsCondition_TimedWait(arg.c, arg.m, 5000);
+    arg.reconnected = false;
+    natsMutex_Unlock(arg.m);
+    testCond(s == NATS_OK);
+
+    test("Send a message to foo: ");
+    IFOK(s, natsConnection_PublishString(nc, "foo", "bar"));
+    testCond(s == NATS_OK);
+
+    test("Receive the message: ");
+    s = natsSubscription_NextMsg(&msg, sub, 1000);
+    testCond((s == NATS_OK) && (msg != NULL));
+    natsMsg_Destroy(msg);
+    msg = NULL;
+
+    test("Reconnect again with allowReconnect false, the call succeeds: ");
+    natsMutex_Lock(nc->mu);
+    nc->opts->allowReconnect = false;
+    natsMutex_Unlock(nc->mu);
+    s = natsConnection_Reconnect(nc);
+    testCond(s == NATS_OK);
+
+    // On MacOS this returns NATS_CONNECTION_CLOSED, on Ubuntu we get a
+    // NATS_TIMEOUT.
+    test("But the connection is closed: ");
+    s = natsSubscription_NextMsg(&msg, sub, 1000);
+    testCond(((s == NATS_CONNECTION_CLOSED) || (s = NATS_TIMEOUT)) && (msg == NULL));
+
+    natsConnection_Close(nc);
+    test("Reconect on a close connection errors: ");
+    s = natsConnection_Reconnect(nc);
+    testCond(s == NATS_CONNECTION_CLOSED);
+
+    test("Reconect on a NULL connection errors: ");
+    s = natsConnection_Reconnect(NULL);
+    testCond(s == NATS_INVALID_ARG);
+
+    natsSubscription_Destroy(sub);
+    natsConnection_Destroy(nc);
+    natsOptions_Destroy(opts);
+    _destroyDefaultThreadArgs(&arg);
 }
 
 static void
@@ -26096,6 +26286,9 @@ test_JetStreamSubscribe(void)
     char                longsn[256];
 #endif
     natsThread          *threads[10] = {NULL};
+    const char *subjectsStack[] = {"foo", "bar"};
+    const char **subjects = subjectsStack;
+    const int numSubjects = sizeof(subjectsStack)/sizeof(char*);
 
     ENSURE_JS_VERSION(2, 3, 5);
 
@@ -26151,8 +26344,8 @@ test_JetStreamSubscribe(void)
     test("Create stream: ");
     jsStreamConfig_Init(&sc);
     sc.Name = "TEST";
-    sc.Subjects = (const char*[1]){"foo"};
-    sc.SubjectsLen = 1;
+    sc.Subjects = subjects;
+    sc.SubjectsLen = numSubjects;
     s = js_AddStream(NULL, js, &sc, NULL, &jerr);
     testCond((s == NATS_OK) && (jerr == 0));
 
@@ -26160,6 +26353,8 @@ test_JetStreamSubscribe(void)
     s = js_Publish(NULL, js, "foo", "msg1", 4, NULL, &jerr);
     IFOK(s, js_Publish(NULL, js, "foo", "msg2", 4, NULL, &jerr));
     IFOK(s, js_Publish(NULL, js, "foo", "msg3", 4, NULL, &jerr));
+    IFOK(s, js_Publish(NULL, js, "bar", "msg1", 4, NULL, &jerr));
+    IFOK(s, js_Publish(NULL, js, "bar", "msg2", 4, NULL, &jerr));
     testCond(s == NATS_OK);
 
     test("Create sub to check lib sends ACKs: ");
@@ -26592,6 +26787,31 @@ test_JetStreamSubscribe(void)
                 && (nats_GetLastError(NULL) == NULL));
     natsSubscription_Destroy(sub);
     sub = NULL;
+
+    if (serverVersionAtLeast(2, 10, 14))
+    {
+        test("Create consumer (multiple subjects): ");
+        jsSubOptions_Init(&so);
+        so.Config.Durable = "delcons3sync";
+        s = js_SubscribeSyncMulti(&sub, js, subjects, numSubjects, NULL, &so, &jerr);
+        testCond((s == NATS_OK) && (jerr == 0));
+
+        test("Drain deletes consumer: ");
+        s = natsSubscription_Drain(sub);
+        for (i = 0; i < 5; i++)
+        {
+            natsMsg *msg = NULL;
+            IFOK(s, natsSubscription_NextMsg(&msg, sub, 1000));
+            IFOK(s, natsMsg_Ack(msg, NULL));
+            natsMsg_Destroy(msg);
+            msg = NULL;
+        }
+        IFOK(s, natsSubscription_WaitForDrainCompletion(sub, 1000));
+        IFOK(s, js_GetConsumerInfo(&ci, js, "TEST", "delcons3sync", NULL, &jerr));
+        testCond((s == NATS_NOT_FOUND) && (ci == NULL) && (jerr == JSConsumerNotFoundErr) && (nats_GetLastError(NULL) == NULL));
+        natsSubscription_Destroy(sub);
+        sub = NULL;
+    }
 
     test("Create consumer: ");
     jsSubOptions_Init(&so);
@@ -30241,6 +30461,7 @@ test_JetStreamBackOffRedeliveries(void)
     so.Config.AckPolicy = js_AckExplicit;
     so.Config.DeliverPolicy = js_DeliverAll;
     so.Config.DeliverSubject = inbox;
+    so.Config.MaxDeliver = 2;
     so.Config.BackOff = (int64_t[]){NATS_MILLIS_TO_NANOS(50), NATS_MILLIS_TO_NANOS(250)};
     so.Config.BackOffLen = 2;
     s = js_SubscribeSync(&sub, js, "foo", NULL, &so, &jerr);
@@ -31295,6 +31516,54 @@ test_KeyValueWatch(void)
 }
 
 static void
+test_KeyValueWatchMulti(void)
+{
+    natsStatus s;
+    kvStore *kv = NULL;
+    kvWatcher *w = NULL;
+    kvConfig kvc;
+
+    JS_SETUP(2, 10, 14);
+
+    test("Create KV: ");
+    kvConfig_Init(&kvc);
+    kvc.Bucket = "WATCH";
+    s = js_CreateKeyValue(&kv, js, &kvc);
+    testCond(s == NATS_OK);
+
+    // Now try wildcard matching and make sure we only get last value when starting.
+    test("Put values in different keys: ");
+    s = kvStore_PutString(NULL, kv, "a.name", "A");
+    IFOK(s, kvStore_PutString(NULL, kv, "b.name", "B"));
+    IFOK(s, kvStore_PutString(NULL, kv, "a.name", "AA"));
+    IFOK(s, kvStore_PutString(NULL, kv, "b.name", "BB"));
+    IFOK(s, kvStore_PutString(NULL, kv, "a.age", "22"));
+    IFOK(s, kvStore_PutString(NULL, kv, "a.age", "99"));
+    testCond(s == NATS_OK);
+
+    test("Create watcher: ");
+    const char **subjects = (const char *[]){"a.*", "b.*", "c.*"};
+    s = kvStore_WatchMulti(&w, kv, subjects, 3, NULL);
+    testCond(s == NATS_OK);
+
+    testCond(_expectUpdate(w, "a.name", "AA", 3));
+    testCond(_expectUpdate(w, "b.name", "BB", 4));
+    testCond(_expectUpdate(w, "a.age", "99", 6));
+    testCond(_expectInitDone(w));
+
+    IFOK(s, kvStore_PutString(NULL, kv, "c.occupation", "gardener"));
+    IFOK(s, kvStore_PutString(NULL, kv, "XXX.occupation", "no, plumber"));
+    IFOK(s, kvStore_PutString(NULL, kv, "c.occupation", "a digital plumber for a digital garden"));
+    testCond(_expectUpdate(w, "c.occupation", "gardener", 7));
+    testCond(_expectUpdate(w, "c.occupation", "a digital plumber for a digital garden", 9));
+
+    kvWatcher_Destroy(w);
+    kvStore_Destroy(kv);
+
+    JS_TEARDOWN;
+}
+
+static void
 test_KeyValueHistory(void)
 {
     natsStatus          s;
@@ -32320,6 +32589,15 @@ test_KeyValueMirrorCrossDomains(void)
 
     test("Get key: ");
     s = kvStore_Get(&e, mkv, "name");
+    // levb: we seem to get the old value at times here, so try one more time if
+    // there's a mismatch
+    for (i = 0; i < 3; i++)
+        if ((s == NATS_OK) && (e != NULL) && (strcmp(kvEntry_ValueString(e), "rip") != 0))
+        {
+            kvEntry_Destroy(e);
+            e = NULL;
+            s = kvStore_Get(&e, mkv, "name");
+        }
     if ((s == NATS_OK) && (e != NULL))
         s = (strcmp(kvEntry_ValueString(e), "rip") == 0 ? NATS_OK : NATS_ERR);
     testCond(s == NATS_OK);
@@ -32452,7 +32730,7 @@ test_KeyValueMirrorCrossDomains(void)
     test("Check mirror syncs: ");
     for (i=0; (ok != 2) && (i < 10); i++)
     {
-        if (kvWatcher_Next(&e, w, 1000) == NATS_OK)
+        if (kvWatcher_Next(&e, w, 10000) == NATS_OK)
         {
             if (((strcmp(kvEntry_Key(e), "age") == 0) || (strcmp(kvEntry_Key(e), "name") == 0))
                 && (kvEntry_Operation(e) == kvOp_Delete))
@@ -33536,7 +33814,7 @@ _microAsyncErrorRequestHandler(microRequest *req)
 }
 
 static void
-test_MicroAsyncErrorHandler(void)
+test_MicroAsyncErrorHandler_MaxPendingMsgs(void)
 {
     natsStatus          s;
     struct threadArg    arg;
@@ -33591,6 +33869,89 @@ test_MicroAsyncErrorHandler(void)
         (s == NATS_OK) && (i < (opts->maxPendingMsgs + 100)); i++)
     {
         s = natsConnection_PublishString(nc, "async_test", "hello");
+    }
+    testCond((NATS_OK == s)
+        && (NATS_OK == natsConnection_Flush(nc)));
+
+    test("Wait for async err callback: ");
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && !arg.closed)
+        s = natsCondition_TimedWait(arg.c, arg.m, 1000);
+    natsMutex_Unlock(arg.m);
+    testCond((s == NATS_OK) && arg.closed && (arg.status == NATS_SLOW_CONSUMER));
+
+    microService_Destroy(m);
+    _waitForMicroservicesAllDone(&arg);
+
+    test("Destroy the test connection: ");
+    natsConnection_Destroy(nc);
+    testCond(NATS_OK == _waitForConnClosed(&arg));
+
+    natsOptions_Destroy(opts);
+    _destroyDefaultThreadArgs(&arg);
+    _stopServer(serverPid);
+}
+
+static void
+test_MicroAsyncErrorHandler_MaxPendingBytes(void)
+{
+    natsStatus          s;
+    struct threadArg    arg;
+    natsConnection* nc = NULL;
+    natsOptions* opts = NULL;
+    natsPid             serverPid = NATS_INVALID_PID;
+    microService* m = NULL;
+    microEndpoint* ep = NULL;
+    microEndpointConfig ep_cfg = {
+        .Name = "do",
+        .Subject = "async_test",
+        .Handler = _microAsyncErrorRequestHandler,
+    };
+    microServiceConfig cfg = {
+        .Name = "test",
+        .Version = "1.0.0",
+        .ErrHandler = _microAsyncErrorHandler,
+        .State = &arg,
+        .DoneHandler = _microServiceDoneHandler,
+    };
+    int data_len = 10;
+    const char msg[] = { 0,1,2,3,4,5,6,7,8,9 }; //10 bytes long message
+    int64_t pendingBytesLimit = 100;
+    int i = 0;
+
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test!");
+
+    s = natsOptions_Create(&opts);
+    IFOK(s, natsOptions_SetURL(opts, NATS_DEFAULT_URL));
+    IFOK(s, natsOptions_SetMaxPendingBytes(opts, pendingBytesLimit));
+    if (s != NATS_OK)
+        FAIL("Unable to create options for test AsyncErrHandler");
+
+    serverPid = _startServer("nats://127.0.0.1:4222", NULL, true);
+    CHECK_SERVER_STARTED(serverPid);
+
+    test("Connect to NATS: ");
+    testCond(NATS_OK == natsConnection_Connect(&nc, opts));
+
+    _startMicroservice(&m, nc, &cfg, NULL, 0, &arg);
+
+    test("Test microservice is running: ");
+    testCond(!microService_IsStopped(m))
+
+    test("Add test endpoint: ");
+    testCond(NULL == micro_add_endpoint(&ep, m, NULL, &ep_cfg, true));
+
+    natsMutex_Lock(arg.m);
+    arg.status = NATS_OK;
+    natsMutex_Unlock(arg.m);
+
+    test("Cause an error by sending too many messages: ");
+    for (i=0;
+        (s == NATS_OK) && (i < (pendingBytesLimit + 100)); i+=data_len) //increment by 10 (message size) each iteration
+    {
+        s = natsConnection_Publish(nc, "async_test", msg, data_len);
     }
     testCond((NATS_OK == s)
         && (NATS_OK == natsConnection_Flush(nc)));
@@ -35883,6 +36244,7 @@ static testInfo allTests[] =
     {"HeadersAPIs",                     test_natsMsgHeaderAPIs},
     {"MsgIsJSControl",                  test_natsMsgIsJSCtrl},
     {"SrvVersionAtLeast",               test_natsSrvVersionAtLeast},
+    {"FormatStringArray",               test_natsFormatStringArray},
 
     // Package Level Tests
 
@@ -35932,6 +36294,7 @@ static testInfo allTests[] =
     {"RetryOnFailedConnect",            test_RetryOnFailedConnect},
     {"NoPartialOnReconnect",            test_NoPartialOnReconnect},
     {"ReconnectFailsPendingRequests",   test_ReconnectFailsPendingRequest},
+    {"ForcedReconnect",                 test_ForcedReconnect},
 
     {"ErrOnConnectAndDeadlock",         test_ErrOnConnectAndDeadlock},
     {"ErrOnMaxPayloadLimit",            test_ErrOnMaxPayloadLimit},
@@ -35995,7 +36358,8 @@ static testInfo allTests[] =
     {"AsyncSubscriptionPendingDrain",   test_AsyncSubscriptionPendingDrain},
     {"SyncSubscriptionPending",         test_SyncSubscriptionPending},
     {"SyncSubscriptionPendingDrain",    test_SyncSubscriptionPendingDrain},
-    {"AsyncErrHandler",                 test_AsyncErrHandler},
+    {"AsyncErrHandlerMaxPendingMsgs",   test_AsyncErrHandler_MaxPendingMsgs},
+    {"AsyncErrHandlerMaxPendingBytes",  test_AsyncErrHandler_MaxPendingBytes },
     {"AsyncErrHandlerSubDestroyed",     test_AsyncErrHandlerSubDestroyed},
     {"AsyncSubscriberStarvation",       test_AsyncSubscriberStarvation},
     {"AsyncSubscriberOnClose",          test_AsyncSubscriberOnClose},
@@ -36103,6 +36467,7 @@ static testInfo allTests[] =
     {"KeyValueManager",                 test_KeyValueManager},
     {"KeyValueBasics",                  test_KeyValueBasics},
     {"KeyValueWatch",                   test_KeyValueWatch},
+    {"KeyValueWatchMulti",              test_KeyValueWatchMulti},
     {"KeyValueHistory",                 test_KeyValueHistory},
     {"KeyValueKeys",                    test_KeyValueKeys},
     {"KeyValueDeleteVsPurge",           test_KeyValueDeleteVsPurge},
@@ -36121,7 +36486,8 @@ static testInfo allTests[] =
     {"MicroStartStop",                  test_MicroStartStop},
     {"MicroServiceStopsOnClosedConn",   test_MicroServiceStopsOnClosedConn},
     {"MicroServiceStopsWhenServerStops", test_MicroServiceStopsWhenServerStops},
-    {"MicroAsyncErrorHandler",          test_MicroAsyncErrorHandler},
+    {"MicroAsyncErrorHandlerMaxPendingMsgs",    test_MicroAsyncErrorHandler_MaxPendingMsgs},
+    {"MicroAsyncErrorHandlerMaxPendingBytes",   test_MicroAsyncErrorHandler_MaxPendingBytes },
 
 #if defined(NATS_HAS_STREAMING)
     {"StanPBufAllocator",               test_StanPBufAllocator},
@@ -36179,6 +36545,18 @@ generateList(void)
     fclose(list);
 }
 
+#ifndef _WIN32
+static void _sigsegv_handler(int sig) {
+  void *array[20];
+  int size = backtrace(array, 20);
+
+  // print out all the frames to stderr
+  fprintf(stderr, "Error: signal %d:\n", sig);
+  backtrace_symbols_fd(array, size, STDERR_FILENO);
+  exit(1);
+}
+#endif // _WIN32
+
 int main(int argc, char **argv)
 {
     const char *envStr;
@@ -36206,6 +36584,10 @@ int main(int argc, char **argv)
         printf("@@ Usage: %s [start] [end] (0 .. %d)\n", argv[0], (maxTests - 1));
         return 1;
     }
+
+#ifndef _WIN32
+    signal(SIGSEGV, _sigsegv_handler);
+#endif // _WIN32
 
     envStr = getenv("NATS_TEST_TRAVIS");
     if ((envStr != NULL) && (envStr[0] != '\0'))

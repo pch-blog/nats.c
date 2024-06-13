@@ -5,7 +5,7 @@ include(CTest)
 include(FindPackageHandleStandardArgs)
 
 # Uncomment to have the build process verbose
-#set(CMAKE_VERBOSE_MAKEFILE TRUE)
+# set(CMAKE_VERBOSE_MAKEFILE TRUE)
 
 # Uncomment to have the executable moved to 'build' instead of their respective 'build/xxx' directories
 #set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR})
@@ -177,7 +177,9 @@ if(UNIX)
   else(APPLE)
     set(NATS_OS "LINUX")
     set(NATS_USE_PTHREAD "-pthread")
-    set(NATS_EXTRA_LIB "rt -lpthread")
+    if(NOT ANDROID)
+      set(NATS_EXTRA_LIB "rt -lpthread")
+    endif()
   endif(APPLE)
   if (${NATS_BUILD_ARCH} MATCHES "32")
     if(NOT APPLE)

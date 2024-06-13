@@ -42,6 +42,7 @@ HeadersLift
 HeadersAPIs
 MsgIsJSControl
 SrvVersionAtLeast
+FormatStringArray
 ReconnectServerStats
 ParseStateReconnectFunctionality
 ServersRandomize
@@ -85,6 +86,7 @@ ReconnectBufSize
 RetryOnFailedConnect
 NoPartialOnReconnect
 ReconnectFailsPendingRequests
+ForcedReconnect
 ErrOnConnectAndDeadlock
 ErrOnMaxPayloadLimit
 Auth
@@ -146,7 +148,8 @@ AsyncSubscriptionPending
 AsyncSubscriptionPendingDrain
 SyncSubscriptionPending
 SyncSubscriptionPendingDrain
-AsyncErrHandler
+AsyncErrHandlerMaxPendingMsgs
+AsyncErrHandlerMaxPendingBytes
 AsyncErrHandlerSubDestroyed
 AsyncSubscriberStarvation
 AsyncSubscriberOnClose
@@ -249,6 +252,7 @@ JetStreamInfoAlternates
 KeyValueManager
 KeyValueBasics
 KeyValueWatch
+KeyValueWatchMulti
 KeyValueHistory
 KeyValueKeys
 KeyValueDeleteVsPurge
@@ -266,7 +270,8 @@ MicroBasics
 MicroStartStop
 MicroServiceStopsOnClosedConn
 MicroServiceStopsWhenServerStops
-MicroAsyncErrorHandler
+MicroAsyncErrorHandlerMaxPendingMsgs
+MicroAsyncErrorHandlerMaxPendingBytes
 StanPBufAllocator
 StanConnOptions
 StanSubOptions
