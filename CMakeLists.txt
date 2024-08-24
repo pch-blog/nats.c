@@ -7,8 +7,14 @@ include(FindPackageHandleStandardArgs)
 # Uncomment to have the build process verbose
 # set(CMAKE_VERBOSE_MAKEFILE TRUE)
 
-# Uncomment to have the executable moved to 'build' instead of their respective 'build/xxx' directories
-#set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR})
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Set output directories for libraries and executables.
+# This is important for Windows builds to have the DLLs in the same directory as the executables.
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Set a default build type if none was specified
 set(default_build_type "Release")
@@ -196,9 +202,17 @@ if(UNIX)
 elseif(WIN32)
   set(NATS_LIBDIR "lib")
   set(NATS_INCLUDE_DIR "include")
-  set(NATS_EXTRA_LIB "Ws2_32")
+  set(NATS_EXTRA_LIB "ws2_32")
   set(NATS_OS "_WIN32")
   set(NATS_PLATFORM_INCLUDE "win")
+
+  # Warning control.
+  add_compile_options(/W4) # Set warning level to maximum, then disable:
+  add_compile_options(/wd4100) # unreferenced formal parameter
+  add_compile_options(/wd4200) # nonstandard extension used: zero-sized array in struct/union
+  add_compile_options(/wd4130) # logical operation on address of string constant
+  add_compile_options(/wd4127) # conditional expression is constant
+
   if(sodium_USE_STATIC_LIBS)
     add_definitions(
       -DSODIUM_STATIC
