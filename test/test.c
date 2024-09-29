@@ -86,8 +86,8 @@ static const char *natsStreamingServerExe = "nats-streaming-server";
 natsMutex *slMu  = NULL;
 natsHash  *slMap = NULL;
 
-#define test(s)         { printf("#%02d ", ++tests); printf("%s\n", (s)); fflush(stdout); }
-#define testf(s, ...)   { printf("#%02d ", ++tests); printf((s "\n"), __VA_ARGS__); fflush(stdout); }
+#define test(s)         { printf("#%02d ", ++tests); printf("%s", (s)); fflush(stdout); }
+#define testf(s, ...)   { printf("#%02d ", ++tests); printf((s), __VA_ARGS__); fflush(stdout); }
 
 #ifdef _WIN32
 #define testCond(c)         if(c) { printf("PASSED\n"); fflush(stdout); } else { printf("FAILED\n"); nats_PrintLastErrorStack(stdout); fflush(stdout); failed=true; return; }
@@ -124,6 +124,7 @@ struct threadArg
     int             timerStopped;
     natsStrHash     *inboxes;
     natsStatus      status;
+    char            lastErrorBuf[256];
     const char*     string;
     int             N;
     bool            connected;
@@ -7699,7 +7700,7 @@ static int _numRunningThreads(natsDispatcherPool *pool)
 {
     int i, n;
     for (n = 0, i = 0; i < pool->cap; i++)
-        n += (pool->dispatchers[i].thread != NULL);
+        n += (pool->dispatchers[i] != NULL);
     return n;
 }
 
@@ -7726,7 +7727,7 @@ void test_AssignSubToDispatch(void)
     char pubSubj[32];
     int i=0, n=0;
 
-    const int numMsgs = 5;
+    const int numMsgs = 100;
 
     typedef struct
     {
@@ -7849,7 +7850,7 @@ void test_AssignSubToDispatch(void)
             for (i = 0; (s == NATS_OK) && (i < tc->numSubs); i++)
             {
                 natsSub_Lock(subs[i]);
-                if (subs[i]->dispatcher != &pool->dispatchers[i % tc->expectedDispatchers])
+                if (subs[i]->dispatcher != pool->dispatchers[i % tc->expectedDispatchers])
                     s = NATS_ERR;
                 natsSub_Unlock(subs[i]);
             }
@@ -22727,7 +22728,7 @@ if (!serverVersionAtLeast((major), (minor), (update))) \
     return; \
 }
 
-#define JS_SETUP(major, minor, update) \
+#define JS_SETUP_WITH_OPTS(major, minor, update, opts) \
 natsConnection  *nc = NULL; \
 jsCtx           *js = NULL; \
 natsPid         pid = NATS_INVALID_PID;  \
@@ -22744,12 +22745,14 @@ CHECK_SERVER_STARTED(pid);                                  \
 testCond(true);                                             \
 \
 test("Connect: ");                                      \
-s = natsConnection_ConnectTo(&nc, NATS_DEFAULT_URL);    \
+s = natsConnection_Connect(&nc, opts);                  \
 testCond(s == NATS_OK);                                 \
 \
 test("Get context: ");                          \
 s = natsConnection_JetStream(&js, nc, NULL);    \
 testCond(s == NATS_OK);
+
+#define JS_SETUP(major, minor, update) JS_SETUP_WITH_OPTS((major), (minor), (update), NULL)
 
 #define JS_TEARDOWN \
 jsCtx_Destroy(js);          \
@@ -23249,7 +23252,7 @@ void test_JetStreamMgtStreams(void)
             && (si != NULL)
             && (si->Config != NULL)
             && (strcmp(si->Config->Name, "TEST210") == 0)
-            && (si->Config->Metadata.Count == 2)
+            && (si->Config->Metadata.Count >= 2)
             && (si->Config->Compression == js_StorageCompressionS2)
             && (si->Config->FirstSeq == 9999)
             && (strcmp(si->Config->SubjectTransform.Source, "foo210") == 0)
@@ -27938,9 +27941,45 @@ void test_JetStreamSubscribeFlowControl(void)
     char                *subj = NULL;
     natsBuffer          *buf  = NULL;
 
-    JS_SETUP(2, 3, 3);
+    natsConnection *nc = NULL;
+    jsCtx *js = NULL;
+    natsPid pid = NATS_INVALID_PID;
+    char confFile[256] = {'\0'};
+    char datastore[256] = {'\0'};
+    char cmdLine[1024] = {'\0'};
 
-    data = malloc(100*1024);
+    ENSURE_JS_VERSION(2, 3, 3);
+
+    test("Start server: ");
+    _makeUniqueDir(datastore, sizeof(datastore), "datastore_");
+
+    if (serverVersionAtLeast(2, 11, 0))
+    {
+        _createConfFile(confFile, sizeof(confFile),
+                        "jetstream: {\n"
+                        "   enabled: true\n"
+                        "   max_buffered_size: 1Gb\n"
+                        "   max_buffered_msgs: 20000\n"
+                        "}\n");
+        snprintf(cmdLine, sizeof(cmdLine), "-js -sd %s -c %s", datastore, confFile);
+    }
+    else
+    {
+        snprintf(cmdLine, sizeof(cmdLine), "-js -sd %s", datastore);
+    }
+    pid = _startServer("nats://127.0.0.1:4222", cmdLine, true);
+    CHECK_SERVER_STARTED(pid);
+    testCond(true);
+
+    test("Connect: ");
+    s = natsConnection_Connect(&nc, NULL);
+    testCond(s == NATS_OK);
+
+    test("Get context: ");
+    s = natsConnection_JetStream(&js, nc, NULL);
+    testCond(s == NATS_OK);
+
+    data = malloc(100 * 1024);
     if (data == NULL)
         FAIL("Unable to allocate data");
 
@@ -28080,6 +28119,7 @@ void test_JetStreamSubscribeFlowControl(void)
     natsSubscription_Destroy(nsub);
     _destroyDefaultThreadArgs(&args);
     JS_TEARDOWN;
+    remove(confFile);
 }
 
 static void
@@ -28504,7 +28544,7 @@ void test_JetStreamSubscribePull(void)
 
     test("Max waiting error: ");
     s = natsSubscription_Fetch(&list, sub, 1, 1000, &jerr);
-    testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "Exceeded") != NULL));
+    testCond((s == NATS_LIMIT_REACHED) && (strstr(nats_GetLastError(NULL), "Exceeded") != NULL));
     nats_clearLastError();
 
     natsSubscription_Destroy(sub2);
@@ -28647,7 +28687,7 @@ void test_JetStreamSubscribePull(void)
     fr.MaxBytes = 2048;
     fr.Expires = NATS_SECONDS_TO_NANOS(1);
     s = natsSubscription_FetchRequest(&list, sub, &fr);
-    testCond((s == NATS_ERR) && (list.Count == 0) && (list.Msgs == NULL)
+    testCond((s == NATS_LIMIT_REACHED) && (list.Count == 0) && (list.Msgs == NULL)
                 && (strstr(nats_GetLastError(NULL), "Exceeded MaxRequestMaxBytes") != NULL));
     nats_clearLastError();
 
@@ -28739,6 +28779,794 @@ void test_JetStreamSubscribePull(void)
     natsSubscription_Destroy(sub);
     JS_TEARDOWN;
     _destroyDefaultThreadArgs(&args);
+}
+
+static void
+_jsPubReconnectThread(void *closure)
+{
+    jsCtx   *js = (jsCtx*) closure;
+
+    nats_Sleep(5);
+    js_Publish(NULL, js, "foo", "hello", 5, NULL, NULL);
+    natsConnection_Flush(js->nc);
+
+    natsConnection_Reconnect(js->nc);
+    nats_Sleep(500);
+
+    js_Publish(NULL, js, "foo", "hell1", 5, NULL, NULL);
+    natsConnection_Flush(js->nc);
+}
+
+void test_JetStreamSubscribePull_Reconnect(void)
+{
+    natsStatus s;
+    JS_SETUP(2, 9, 2);
+
+    test("Create stream: ");
+    jsErrCode jerr = 0;
+    jsStreamConfig sc;
+    jsStreamConfig_Init(&sc);
+    sc.Name = "TEST";
+    sc.Subjects = (const char *[1]){"foo"};
+    sc.SubjectsLen = 1;
+    s = js_AddStream(NULL, js, &sc, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    test("Subscribe: ");
+    natsSubscription *sub = NULL;
+    s = js_PullSubscribe(&sub, js, "foo", "dur", NULL, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Start thread to send: ");
+    natsThread *t = NULL;
+    s = natsThread_Create(&t, _jsPubReconnectThread, (void*) js);
+    testCond(s == NATS_OK);
+
+    test("Fetch request succeeds over a reconnect: ");
+    jsFetchRequest fr = {
+        .Batch = 2,
+        .Expires = NATS_SECONDS_TO_NANOS(10),
+    };
+    natsMsgList list;
+    s = natsSubscription_FetchRequest(&list, sub, &fr);
+    testCond((s == NATS_OK) && (list.Count == 2));
+    natsMsgList_Destroy(&list);
+
+    natsThread_Join(t);
+    natsThread_Destroy(t);
+    natsSubscription_Destroy(sub);
+    JS_TEARDOWN;
+}
+
+static void
+_recvPullAsync(natsConnection *nc, natsSubscription *sub, natsMsg *msg,
+                void *closure)
+{
+    struct threadArg *arg = (struct threadArg *)closure;
+
+    natsMutex_Lock(arg->m);
+    arg->sum++;
+
+    switch (arg->control)
+    {
+    case 1:
+        arg->msgReceived = true;
+        natsMsg_Ack(msg, NULL);
+        natsCondition_Signal(arg->c);
+        break;
+
+    case 2:
+        arg->msgReceived = true;
+        natsCondition_Signal(arg->c);
+        break;
+
+    case 3:
+        arg->msgReceived = true;
+        natsCondition_Signal(arg->c);
+        natsCondition_Wait(arg->c, arg->m);
+        break;
+    }
+
+    natsMsg_Destroy(msg);
+    natsMutex_Unlock(arg->m);
+}
+
+static void
+_completePullAsync(natsConnection *nc, natsSubscription *sub, natsStatus exitStatus,
+                void *closure)
+{
+    struct threadArg *arg = (struct threadArg *)closure;
+    natsMutex_Lock(arg->m);
+    arg->closed = true;
+    arg->status = exitStatus;
+    const char *le = nats_GetLastError(NULL);
+    if (le != NULL)
+        strncpy(arg->lastErrorBuf, le, sizeof(arg->lastErrorBuf)-1);
+    natsCondition_Broadcast(arg->c);
+    natsMutex_Unlock(arg->m);
+}
+
+static bool
+_testBatchCompleted(struct threadArg *args, natsSubscription *sub, natsStatus expectedStatus, int expectedMsgs, bool orFewer)
+{
+    natsStatus s = NATS_OK;
+    natsMutex_Lock(args->m);
+    while ((s != NATS_TIMEOUT) && !args->closed)
+        s = natsCondition_TimedWait(args->c, args->m, 1000); // 1 second should always be enough
+
+    bool result = ((s == NATS_OK) &&
+                   args->closed &&
+                   (args->status == expectedStatus));
+
+    if (orFewer)
+        result = result && (args->sum <= expectedMsgs);
+    else
+        result = result && (args->sum == expectedMsgs);
+    natsMutex_Unlock(args->m);
+
+    // We may get called before the delivery thread terminates the sub, this
+    // yields and avoids the race for the purpose of the test.
+    nats_Sleep(1);
+
+    result = result && !natsSubscription_IsValid(sub);
+    if (!result)
+    {
+        if (s != NATS_OK)
+            printf("FAILED: timed out: %d\n", s);
+        if (!args->closed)
+            printf("FAILED: onComplete has not been called\n");
+        if (args->status != expectedStatus)
+            printf("FAILED: status: %d, expected: %d\n", args->status, expectedStatus);
+        if (orFewer)
+        {
+            if (args->sum > expectedMsgs)
+                printf("FAILED: msgs: %d, expected at most: %d\n", args->sum, expectedMsgs);
+        }
+        else
+        {
+            if (args->sum != expectedMsgs)
+                printf("FAILED: msgs: %d, expected: %d\n", args->sum, expectedMsgs);
+        }
+        if (natsSubscription_IsValid(sub))
+            printf("FAILED: subscription is still valid\n");
+    }
+    return result;
+}
+
+void test_JetStreamSubscribePullAsync(void)
+{
+    natsStatus s;
+    natsSubscription *sub = NULL;
+    natsMsg *msg = NULL;
+    jsErrCode jerr = 0;
+    natsMsgList list;
+    jsStreamConfig sc;
+    jsOptions jsOpts;
+    jsSubOptions so;
+    struct threadArg args;
+    jsConsumerConfig cc;
+
+    JS_SETUP(2, 9, 2);
+
+    s = _createDefaultThreadArgsForCbTests(&args);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    test("Create stream: ");
+    jsStreamConfig_Init(&sc);
+    sc.Name = "TEST";
+    sc.Subjects = (const char *[1]){"foo"};
+    sc.SubjectsLen = 1;
+    s = js_AddStream(NULL, js, &sc, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    // TEST various error conditions.
+
+    test("Create pull sub async (invalid args): ");
+    s = js_PullSubscribeAsync(NULL, js, "foo", "dur", _recvPullAsync, &args, NULL, NULL, &jerr);
+    if (s == NATS_INVALID_ARG)
+        s = js_PullSubscribeAsync(&sub, NULL, "foo", "dur", _recvPullAsync, &args, NULL, NULL, &jerr);
+    if (s == NATS_INVALID_ARG)
+        s = js_PullSubscribeAsync(&sub, js, NULL, "dur", _recvPullAsync, &args, NULL, NULL, &jerr);
+    if (s == NATS_INVALID_ARG)
+        s = js_PullSubscribeAsync(NULL, js, "", "dur", _recvPullAsync, &args, NULL, NULL, &jerr);
+    if (s == NATS_INVALID_ARG)
+        s = js_PullSubscribeAsync(&sub, js, "foo", "dur", NULL, &args, NULL, NULL, &jerr);
+    testCond((s == NATS_INVALID_ARG) && (sub == NULL) && (jerr == 0));
+    nats_clearLastError();
+
+    test("AckNone ok: ");
+    jsSubOptions_Init(&so);
+    so.Config.AckPolicy = js_AckNone;
+    s = js_PullSubscribeAsync(&sub, js, "foo", "ackNone", _recvPullAsync, &args, NULL, &so, &jerr);
+    testCond((s == NATS_OK) && (sub != NULL) && (jerr == 0));
+    natsSubscription_Unsubscribe(sub);
+    natsSubscription_Destroy(sub);
+    sub = NULL;
+
+    test("AckAll ok: ");
+    jsSubOptions_Init(&so);
+    so.Config.AckPolicy = js_AckAll;
+    s = js_PullSubscribeAsync(&sub, js, "foo", "ackAll", _recvPullAsync, &args, NULL, &so, &jerr);
+    testCond((s == NATS_OK) && (sub != NULL) && (jerr == 0));
+    natsSubscription_Unsubscribe(sub);
+    natsSubscription_Destroy(sub);
+    sub = NULL;
+
+    test("Create push consumer: ");
+    jsConsumerConfig_Init(&cc);
+    cc.Durable = "push_dur";
+    cc.DeliverSubject = "push.deliver";
+    s = js_AddConsumer(NULL, js, "TEST", &cc, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    test("Try create pull sub from push consumer: ");
+    s = js_PullSubscribeAsync(&sub, js, "foo", "push_dur", _recvPullAsync, &args, NULL, &so, &jerr);
+    testCond((s == NATS_ERR) && (sub == NULL) && (jerr == 0) && (strstr(nats_GetLastError(NULL), jsErrPullSubscribeToPushConsumer) != NULL));
+    nats_clearLastError();
+
+    test("Create pull bound failure: ");
+    jsSubOptions_Init(&so);
+    so.Stream = "TEST";
+    so.Consumer = "bar";
+    s = js_PullSubscribeAsync(&sub, js, "foo", "bar", _recvPullAsync, &args, NULL, &so, &jerr);
+    testCond((s == NATS_NOT_FOUND) && (sub == NULL) && (jerr == JSConsumerNotFoundErr));
+    nats_clearLastError();
+
+    // TEST real subscription, auto-ack.
+
+    test("js_PullAsyncSubscribe for real, manual ack: ");
+    // Signal as soon as we get the first message.
+    args.control = 2; // don't ack
+
+    jsSubOptions_Init(&so);
+    so.Config.MaxAckPending = 10;
+    so.Config.AckWait = NATS_MILLIS_TO_NANOS(300);
+    so.ManualAck = true;
+    s = js_PullSubscribeAsync(&sub, js, "foo", "dur", _recvPullAsync, &args, NULL, &so, &jerr);
+    testCond((s == NATS_OK) && (sub != NULL) && (jerr == 0));
+
+    test("Can't call NextMsg: ");
+    s = natsSubscription_NextMsg(&msg, sub, 1000);
+    testCond((s == NATS_ILLEGAL_STATE) && (msg == NULL));
+    nats_clearLastError();
+
+    test("Can't call Fetch: ");
+    s = natsSubscription_Fetch(&list, sub, 1, 500, &jerr);
+    testCond((s == NATS_ERR) && (msg == NULL) && (strstr(nats_GetLastError(NULL), jsErrConcurrentFetchNotAllowed) != NULL));
+    nats_clearLastError();
+
+    int noMessageTimeout = 80;
+    int messageArrivesImmediatelyTimeout = 40;
+    int ackTimeout = (int)(so.Config.AckWait / 1E6) + 100;
+    testf("No messages yet, timeout in %dms: ", noMessageTimeout);
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, noMessageTimeout);
+    testCond(s == NATS_TIMEOUT);
+    natsMutex_Unlock(args.m);
+
+    test("Send a message: ");
+    s = js_Publish(NULL, js, "foo", "hello", 5, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    testf("Arrives in under %dms: ", messageArrivesImmediatelyTimeout);
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, messageArrivesImmediatelyTimeout);
+    testCond((s == NATS_OK) && args.msgReceived);
+    args.msgReceived = false;
+    natsMutex_Unlock(args.m);
+
+    testf("No more messages yet, timeout in %dms: ", noMessageTimeout);
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, noMessageTimeout);
+    testCond(s == NATS_TIMEOUT);
+    s = NATS_OK;
+    args.msgReceived = false;
+    args.control = 1; // ack next
+    natsMutex_Unlock(args.m);
+
+    testf("Wait another so.Config.AckWait+100 = %dms and see that the message is re-delivered, ACK it: ", ackTimeout);
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, ackTimeout);
+    testCond(s == NATS_OK);
+    args.msgReceived = false;
+    natsMutex_Unlock(args.m);
+
+    testf("Wait another so.Config.AckWait+100 = %dms and see that the message is not re-delivered: ", ackTimeout);
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, ackTimeout);
+    testCond((s == NATS_TIMEOUT) && !args.msgReceived);
+    s = NATS_OK;
+    natsMutex_Unlock(args.m);
+
+    test("Receive msg with header and no data comes through: ");
+    s = natsMsg_create(&msg, sub->subject, (int)strlen(sub->subject), NULL, 0,
+                       "NATS/1.0\r\nk:v\r\n\r\n", 17, 17);
+    IFOK(s, natsConnection_PublishMsg(nc, msg));
+    natsMsg_Destroy(msg);
+
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, messageArrivesImmediatelyTimeout);
+    testCond(s == NATS_OK);
+    args.msgReceived = false;
+    natsMutex_Unlock(args.m);
+
+    natsSubscription_Destroy(sub);
+    sub = NULL;
+
+    // TEST exit criteria.
+    typedef struct
+    {
+        const char *name;
+        bool noWait;
+        int want;
+        int expires; // ms
+        int maxBytes;
+        int before;
+        int during;
+        int fetchSize;
+        natsStatus expectedStatus;
+        int expectedN;
+        bool orFewer;
+    } nowaitTC_t;
+    nowaitTC_t nowaitTCs[] = {
+        {
+            .name = "single fetch NOWAIT, partially fulfilled NATS_TIMEOUT",
+            .noWait = true,
+            .want = 1000,
+            .before = 2,
+            .fetchSize = 13,
+            .expectedStatus = NATS_TIMEOUT,
+            .expectedN = 2,
+        },
+        {
+            .name = "multi-fetch NOWAIT, partially fulfilled NATS_TIMEOUT",
+            .noWait = true,
+            .want = 1000,
+            .before = 117,
+            .fetchSize = 20, // 117 is not divisible by 20
+            .expectedStatus = NATS_TIMEOUT,
+            .expectedN = 117,
+        },
+        {
+            .name = "fetch NOWAIT can get a NATS_NOT_FOUND immediately",
+            .noWait = true,
+            .want = 1000,
+            .before = 0,
+            .fetchSize = 5,
+            .expectedStatus = NATS_NOT_FOUND, // on the second request, since there are no messages waiting.
+            .expectedN = 0,
+        },
+        {
+            .name = "fetch NOWAIT can get a NATS_NOT_FOUND on Nth request",
+            .noWait = true,
+            .want = 1000,
+            .before = 10,
+            .fetchSize = 5,
+            .expectedStatus = NATS_NOT_FOUND, // on the second request, since there are no messages waiting.
+            .expectedN = 10,
+        },
+        {
+            .name = "single fetch NOWAIT, fulfilled msgs NATS_MAX_DELIVERED_MSGS",
+            .noWait = true,
+            .want = 2,
+            .before = 20,
+            .fetchSize = 13,
+            .expectedStatus = NATS_MAX_DELIVERED_MSGS,
+            .expectedN = 2,
+        },
+        {
+            .name = "multi-fetch NOWAIT, fulfilled msgs NATS_MAX_DELIVERED_MSGS",
+            .noWait = true,
+            .want = 100,
+            .before = 117,
+            .fetchSize = 13,
+            .expectedStatus = NATS_MAX_DELIVERED_MSGS,
+            .expectedN = 100,
+        },
+        {
+            .name = "single fetch, fulfilled msgs NATS_MAX_DELIVERED_MSGS",
+            .want = 2,
+            .before = 20,
+            .fetchSize = 13,
+            .expectedStatus = NATS_MAX_DELIVERED_MSGS,
+            .expectedN = 2,
+        },
+        {
+            .name = "multi-fetch WAIT, fulfilled msgs NATS_MAX_DELIVERED_MSGS",
+            .want = 100,
+            .before = 117,
+            .fetchSize = 13,
+            .expectedStatus = NATS_MAX_DELIVERED_MSGS,
+            .expectedN = 100,
+        },
+        {
+            .name = "MaxBytes",
+            .want = 1000,
+            .maxBytes = 100,
+            .before = 20,
+            .expectedStatus = NATS_LIMIT_REACHED,
+            .expectedN = 1,
+        },
+        {
+            .name = "Fetch with expiration is fulfilled NATS_MAX_DELIVERED_MSGS",
+            .want = 30,
+            .expires = 100,
+            .before = 20,
+            .during = 10,
+            .expectedStatus = NATS_MAX_DELIVERED_MSGS,
+            .expectedN = 30,
+        },
+        {
+            .name = "Fetch with a short expiration is partially fulfilled NATS_TIMEOUT",
+            .fetchSize = 11, // just to slow things down
+            .want = 200,
+            .expires = 5,
+            .during = 200,
+            .expectedStatus = NATS_TIMEOUT,
+            .expectedN = 200,
+            .orFewer = true,
+        },
+        {
+            .name = NULL,
+        },
+    };
+    for (nowaitTC_t *tc = nowaitTCs; tc->name != NULL; tc++)
+    {
+        for (int i = 0; (s == NATS_OK) && (i < tc->before); i++)
+            s = js_Publish(NULL, js, "foo", "hello", 5, NULL, &jerr);
+        if (s != NATS_OK)
+            FAIL("Failed to publish, unusual");
+
+        natsMutex_Lock(args.m);
+        args.control = 0;      // don't ack, will be auto-ack
+        args.status = NATS_OK; // batch exit status will be here
+        args.msgReceived = false;
+        args.closed = false;
+        args.sum = 0;
+        natsMutex_Unlock(args.m);
+
+        jsSubOptions_Init(&so);
+        so.Config.MaxAckPending = 10;
+        so.Config.AckWait = NATS_MILLIS_TO_NANOS(300);
+        so.Config.MaxRequestMaxBytes = 777;
+        so.ManualAck = false;
+
+        jsOptions_Init(&jsOpts);
+        jsOpts.PullSubscribeAsync.CompleteHandler = _completePullAsync;
+        jsOpts.PullSubscribeAsync.CompleteHandlerClosure = &args;
+        jsOpts.PullSubscribeAsync.FetchSize = tc->fetchSize;
+        jsOpts.PullSubscribeAsync.MaxMessages = tc->want;
+        jsOpts.PullSubscribeAsync.MaxBytes = tc->maxBytes;
+        jsOpts.PullSubscribeAsync.NoWait = tc->noWait;
+        jsOpts.PullSubscribeAsync.Timeout = tc->expires;
+        s = js_PullSubscribeAsync(&sub, js, "foo", "dur", _recvPullAsync, &args, &jsOpts, &so, &jerr);
+        if ((s != NATS_OK) && (sub == NULL) && (jerr != 0))
+            FAIL("Failed to create pull subscription, unusual");
+
+        for (int i = 0; (s == NATS_OK) && (i < tc->during); i++)
+            s = js_Publish(NULL, js, "foo", "hello", 5, NULL, &jerr);
+        if (s != NATS_OK)
+            FAIL("Failed to publish, unusual");
+
+        testf("%s: ", tc->name);
+        testCond(_testBatchCompleted(
+            &args, sub, tc->expectedStatus, tc->expectedN, tc->orFewer));
+
+        natsSubscription_Destroy(sub);
+        sub = NULL;
+    }
+
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&args);
+}
+
+void test_JetStreamSubscribePullAsync_MissedHB(void)
+{
+    natsStatus s;
+    natsSubscription *sub = NULL;
+    jsErrCode jerr = 0;
+    jsStreamConfig sc;
+    jsOptions jsOpts;
+    struct threadArg args;
+
+    JS_SETUP(2, 9, 2);
+
+    s = _createDefaultThreadArgsForCbTests(&args);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    test("Create stream: ");
+    jsStreamConfig_Init(&sc);
+    sc.Name = "TEST";
+    sc.Subjects = (const char *[1]){"foo"};
+    sc.SubjectsLen = 1;
+    s = js_AddStream(NULL, js, &sc, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    test("Check invalid heartbeat : ");
+    natsMutex_Lock(args.m);
+    args.control = 0;      // don't ack, will be auto-ack
+    args.status = NATS_OK; // batch exit status will be here
+    args.msgReceived = false;
+    args.closed = false;
+    args.sum = 0;
+    natsMutex_Unlock(args.m);
+
+    // Heartbeat too large for the timeout
+    jsOptions_Init(&jsOpts);
+    jsOpts.PullSubscribeAsync.CompleteHandler = _completePullAsync;
+    jsOpts.PullSubscribeAsync.CompleteHandlerClosure = &args;
+    jsOpts.PullSubscribeAsync.MaxMessages = 100;
+    jsOpts.PullSubscribeAsync.Timeout = 100;
+    jsOpts.PullSubscribeAsync.Heartbeat = 200;
+
+    s = js_PullSubscribeAsync(&sub, js, "foo", "dur", _recvPullAsync, &args, &jsOpts, NULL, &jerr);
+    testCond((s == NATS_OK) && _testBatchCompleted(&args, sub, NATS_ERR, 0, false));
+
+    test("Check the error to be 'heartbeat value too large': ");
+    natsMutex_Lock(args.m);
+    testCond(strstr(args.lastErrorBuf, "heartbeat value too large") != NULL);
+    natsMutex_Unlock(args.m);
+    natsSubscription_Destroy(sub);
+    sub = NULL;
+
+    test("Subscribe with 50ms idle hearbeat: ");
+    natsMutex_Lock(args.m);
+    args.control = 0;      // don't ack, will be auto-ack
+    args.status = NATS_OK; // batch exit status will be here
+    args.msgReceived = false;
+    args.closed = false;
+    args.sum = 0;
+    natsMutex_Unlock(args.m);
+
+    // Let's make it wait for 20 seconds, and have HBs every 50ms
+    jsOptions_Init(&jsOpts);
+    jsOpts.PullSubscribeAsync.CompleteHandler = _completePullAsync;
+    jsOpts.PullSubscribeAsync.CompleteHandlerClosure = &args;
+    jsOpts.PullSubscribeAsync.MaxMessages = 100;
+    jsOpts.PullSubscribeAsync.Timeout = 20 * 1000;
+    jsOpts.PullSubscribeAsync.Heartbeat = 50;
+
+    s = js_PullSubscribeAsync(&sub, js, "foo", "dur", _recvPullAsync, &args, &jsOpts, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Subscription is active after 2 heartbeats: ");
+    nats_Sleep(100);
+    natsMutex_Lock(args.m);
+    testCond(!args.closed)
+    natsMutex_Unlock(args.m);
+
+    // Set a message filter that will drop subsequent server's heartbeat
+    // messages.
+    test("Drop heartbeats and see the sub terminate: ");
+    natsConn_setFilter(nc, _dropIdleHBs);
+    testCond((s == NATS_OK) &&
+             _testBatchCompleted(&args, sub,NATS_MISSED_HEARTBEAT, 0, false));
+
+    natsSubscription_Destroy(sub);
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&args);
+}
+
+void test_JetStreamSubscribePullAsync_Unsubscribe(void)
+{
+    natsStatus s;
+    natsSubscription *sub = NULL;
+    jsErrCode jerr = 0;
+    jsStreamConfig sc;
+    jsOptions jsOpts;
+    struct threadArg args;
+
+    JS_SETUP(2, 9, 2);
+
+    s = _createDefaultThreadArgsForCbTests(&args);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    test("Create stream: ");
+    jsStreamConfig_Init(&sc);
+    sc.Name = "TEST";
+    sc.Subjects = (const char *[1]){"foo"};
+    sc.SubjectsLen = 1;
+    s = js_AddStream(NULL, js, &sc, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    test("Publish a few messages: ");
+    s = js_Publish(NULL, js, "foo", "hell0", 5, NULL, &jerr);
+    if (s == NATS_OK)
+        s = js_Publish(NULL, js, "foo", "hell1", 5, NULL, &jerr);
+    if (s == NATS_OK)
+        s = js_Publish(NULL, js, "foo", "hell2", 5, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Subscribe: ");
+    natsMutex_Lock(args.m);
+    args.control = 3;      // wait for signal back
+    args.status = NATS_OK; // batch exit status will be here
+    args.msgReceived = false;
+    args.closed = false;
+    args.sum = 0;
+    natsMutex_Unlock(args.m);
+
+    jsOptions_Init(&jsOpts);
+    jsOpts.PullSubscribeAsync.CompleteHandler = _completePullAsync;
+    jsOpts.PullSubscribeAsync.CompleteHandlerClosure = &args;
+    jsOpts.PullSubscribeAsync.MaxMessages = 100;
+    jsOpts.PullSubscribeAsync.Timeout = 1000;
+
+    s = js_PullSubscribeAsync(&sub, js, "foo", "dur", _recvPullAsync, &args, &jsOpts, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Receive 1 message: ");
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, 100);
+    testCond((s == NATS_OK) && args.msgReceived && (args.closed == false));
+    args.msgReceived = false;
+
+    test("Unsubscribe: ");
+    s = natsSubscription_Unsubscribe(sub);
+    testCond(s == NATS_OK);
+    natsCondition_Signal(args.c); // release the callback
+    natsMutex_Unlock(args.m);
+
+    testCond((s == NATS_OK) &&
+             _testBatchCompleted(&args, sub, NATS_OK, 1, false));
+
+    natsSubscription_Destroy(sub);
+    sub = NULL;
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&args);
+}
+
+void test_JetStreamSubscribePullAsync_Reconnect(void)
+{
+    natsStatus s;
+    JS_SETUP(2, 9, 2);
+
+    test("Create stream: ");
+    jsErrCode jerr = 0;
+    jsStreamConfig sc;
+    jsStreamConfig_Init(&sc);
+    sc.Name = "TEST";
+    sc.Subjects = (const char *[1]){"foo"};
+    sc.SubjectsLen = 1;
+    s = js_AddStream(NULL, js, &sc, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    test("Subscribe, expect 3 messsages, fetch size 2: ");
+    natsSubscription *sub = NULL;
+    jsOptions jsOpts;
+    struct threadArg args;
+
+    s = _createDefaultThreadArgsForCbTests(&args);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    natsMutex_Lock(args.m);
+    args.control = 2;      // no ack
+    args.status = NATS_OK; // batch exit status will be here
+    natsMutex_Unlock(args.m);
+
+    jsOptions_Init(&jsOpts);
+    jsOpts.PullSubscribeAsync.CompleteHandler = _completePullAsync;
+    jsOpts.PullSubscribeAsync.CompleteHandlerClosure = &args;
+    jsOpts.PullSubscribeAsync.FetchSize = 2;
+    jsOpts.PullSubscribeAsync.MaxMessages = 3;
+    jsOpts.PullSubscribeAsync.Timeout = 10 * 1000;
+
+    s = js_PullSubscribeAsync(&sub, js, "foo", "dur", _recvPullAsync, &args, &jsOpts, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Send 1 message: ");
+    s = js_Publish(NULL, js, "foo", "hell0", 5, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Receive 1 message: ");
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, 20);
+    testCond((s == NATS_OK) && args.msgReceived && (args.closed == false));
+    args.msgReceived = false;
+    natsMutex_Unlock(args.m);
+
+    test("Reconnect: ");
+    s = natsConnection_Flush(nc);
+    if (s == NATS_OK)
+        s = natsConnection_Reconnect(nc);
+    nats_Sleep(100);
+    testCond(s == NATS_OK);
+
+    test("Send 2 more messages: ");
+    s = js_Publish(NULL, js, "foo", "hell1", 5, NULL, &jerr);
+    if (s == NATS_OK)
+        s = js_Publish(NULL, js, "foo", "hell2", 5, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Receive all expected messages: ");
+    testCond(_testBatchCompleted(&args, sub, NATS_MAX_DELIVERED_MSGS, 3, false));
+
+    natsSubscription_Destroy(sub);
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&args);
+}
+
+void test_JetStreamSubscribePullAsync_Disconnect(void)
+{
+    natsStatus s;
+    natsOptions *opts = NULL;
+    s = natsOptions_Create(&opts);
+    if (s != NATS_OK)
+        FAIL("Unable to create options");
+    natsOptions_SetAllowReconnect(opts, false);
+    JS_SETUP_WITH_OPTS(2, 9, 2, opts);
+
+    test("Create stream: ");
+    jsErrCode jerr = 0;
+    jsStreamConfig sc;
+    jsStreamConfig_Init(&sc);
+    sc.Name = "TEST";
+    sc.Subjects = (const char *[1]){"foo"};
+    sc.SubjectsLen = 1;
+    s = js_AddStream(NULL, js, &sc, NULL, &jerr);
+    testCond((s == NATS_OK) && (jerr == 0));
+
+    test("Subscribe, expect 2 messsages, fetch size 2: ");
+    natsSubscription *sub = NULL;
+    jsOptions jsOpts;
+    struct threadArg args;
+
+    s = _createDefaultThreadArgsForCbTests(&args);
+    if (s != NATS_OK)
+        FAIL("Unable to setup test");
+
+    natsMutex_Lock(args.m);
+    args.control = 2;      // no ack
+    args.status = NATS_OK; // batch exit status will be here
+    natsMutex_Unlock(args.m);
+
+    jsOptions_Init(&jsOpts);
+    jsOpts.PullSubscribeAsync.CompleteHandler = _completePullAsync;
+    jsOpts.PullSubscribeAsync.CompleteHandlerClosure = &args;
+    jsOpts.PullSubscribeAsync.FetchSize = 2;
+    jsOpts.PullSubscribeAsync.MaxMessages = 2;
+    jsOpts.PullSubscribeAsync.Timeout = 10 * 1000;
+
+    s = js_PullSubscribeAsync(&sub, js, "foo", "dur", _recvPullAsync, &args, &jsOpts, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Send 1 message: ");
+    s = js_Publish(NULL, js, "foo", "hell0", 5, NULL, &jerr);
+    testCond(s == NATS_OK);
+
+    test("Receive 1 message: ");
+    natsMutex_Lock(args.m);
+    while ((s != NATS_TIMEOUT) && !args.msgReceived)
+        s = natsCondition_TimedWait(args.c, args.m, 20);
+    testCond((s == NATS_OK) && args.msgReceived && (args.closed == false));
+    args.msgReceived = false;
+    natsMutex_Unlock(args.m);
+
+    test("Disconnect: ");
+    natsConn_Lock(nc);
+    natsSock_Shutdown(nc->sockCtx.fd);
+    natsConn_Unlock(nc);
+    testCond(s == NATS_OK);
+
+    test("Check fetch completion, expect NATS_OK: ");
+    testCond(_testBatchCompleted(&args, sub, NATS_CONNECTION_CLOSED, 1, false));
+
+    natsSubscription_Destroy(sub);
+    JS_TEARDOWN;
+    _destroyDefaultThreadArgs(&args);
+    natsOptions_Destroy(opts);
 }
 
 void test_JetStreamSubscribeHeadersOnly(void)
@@ -29907,14 +30735,14 @@ void test_JetStreamConvertDirectMsg(void)
 
     test("Bad request: ");
     s = natsMsg_Create(&msg, "inbox", NULL, NULL, 0);
-    IFOK(s, natsMsgHeader_Set(msg, STATUS_HDR, REQ_TIMEOUT));
+    IFOK(s, natsMsgHeader_Set(msg, STATUS_HDR, HDR_STATUS_TIMEOUT_408));
     IFOK(s, natsMsgHeader_Set(msg, DESCRIPTION_HDR, "Bad Request"));
     IFOK(s, js_directGetMsgToJSMsg("test", msg));
     testCond((s == NATS_ERR) && (strstr(nats_GetLastError(NULL), "Bad Request") != NULL));
     nats_clearLastError();
 
     test("Not found: ");
-    s = natsMsgHeader_Set(msg, STATUS_HDR, NOT_FOUND_STATUS);
+    s = natsMsgHeader_Set(msg, STATUS_HDR, HDR_STATUS_NOT_FOUND_404);
     IFOK(s, natsMsgHeader_Set(msg, DESCRIPTION_HDR, "Message Not Found"));
     IFOK(s, js_directGetMsgToJSMsg("test", msg));
     testCond((s == NATS_NOT_FOUND) && (strstr(nats_GetLastError(NULL), natsStatus_GetText(NATS_NOT_FOUND)) != NULL));
@@ -31470,6 +32298,144 @@ void test_KeyValueKeys(void)
     JS_TEARDOWN;
 }
 
+void test_KeyValueKeysWithFilters(void)
+{
+    natsStatus          s;
+    kvStore             *kv = NULL;
+    kvKeysList          l;
+    kvConfig            kvc;
+    const char **defaultSubject = (const char *[]){">"};
+    l.Count = 0;
+    l.Keys = NULL;
+
+    JS_SETUP(2, 10, 14);
+
+    test("Create KV: ");
+    kvConfig_Init(&kvc);
+    kvc.Bucket = "KVSF";
+    kvc.History = 2;
+    s = js_CreateKeyValue(&kv, js, &kvc);
+    testCond(s == NATS_OK);
+
+    test("Populate: ");
+    s = kvStore_PutString(NULL, kv, "a.b", "a.b");
+    IFOK(s, kvStore_PutString(NULL, kv, "a.d", "a.d"));
+    IFOK(s, kvStore_PutString(NULL, kv, "c.d", "c.d"));
+    IFOK(s, kvStore_PutString(NULL, kv, "e.f", "e.f"));
+    IFOK(s, kvStore_PutString(NULL, kv, "e.a.f", "e.a.f"));
+    testCond(s == NATS_OK);
+
+    test("Get keys with filters (bad args): List is NULL");
+    s = kvStore_KeysWithFilters(NULL, kv, defaultSubject, 1, NULL);
+    testCond(s == NATS_INVALID_ARG);
+    nats_clearLastError();
+
+    test("Get keys with filters (bad args): filters is NULL");
+    s = kvStore_KeysWithFilters(&l, kv, NULL, 0, NULL);
+    testCond((s == NATS_INVALID_ARG) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+
+    test("Get keys with filters (bad args): numFilters is 0");
+    s = kvStore_KeysWithFilters(&l, kv, defaultSubject, 0, NULL);
+    testCond((s == NATS_INVALID_ARG) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+
+    test("Get keys with filters (bad args): numFilters is <0");
+    s = kvStore_KeysWithFilters(&l, kv, defaultSubject, -10, NULL);
+    testCond((s == NATS_INVALID_ARG) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+
+    test("Get keys with filters (bad args): empty string");
+    const char **filter0 = (const char *[]){"a.*", "", "b.*"};
+    s = kvStore_KeysWithFilters(&l, kv, filter0, 3, NULL);
+    testCond((s == NATS_INVALID_ARG) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+
+    test("Get keys with filters (bad args): kv is NULL");
+    s = kvStore_KeysWithFilters(&l, NULL, defaultSubject, 1, NULL);
+    testCond((s == NATS_INVALID_ARG) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    test("filter: a.*");
+    const char **filter1 = (const char *[]){"a.*"};
+    s = kvStore_KeysWithFilters(&l, kv, filter1, 1, NULL);
+    testCond((s == NATS_OK) && (l.Keys != NULL) && (l.Count == 2));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    test("filter: *.a.*");
+    const char **filter2 = (const char *[]){"*.a.*"};
+    s = kvStore_KeysWithFilters(&l, kv, filter2, 1, NULL);
+    testCond((s == NATS_OK) && (l.Keys != NULL) && (l.Count == 1));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    test("filter: *.a");
+    const char **filter3 = (const char *[]){"*.a"};
+    s = kvStore_KeysWithFilters(&l, kv, filter3, 1, NULL);
+    testCond((s == NATS_OK) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    test("filter: e.a.f");
+    const char **filter4 = (const char *[]){"e.a.f"};
+    s = kvStore_KeysWithFilters(&l, kv, filter4, 1, NULL);
+    testCond((s == NATS_OK) && (l.Keys != NULL) && (l.Count == 1));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    test("filter: >");
+    const char **filter5 = (const char *[]){">"};
+    s = kvStore_KeysWithFilters(&l, kv, filter5, 1, NULL);
+    testCond((s == NATS_OK) && (l.Keys != NULL) && (l.Count == 5));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    test("filter: multiple overlapping filters");
+    const char **filter6 = (const char *[]){"*.a","a.*","*.a.*"};
+    s = kvStore_KeysWithFilters(&l, kv, filter6, 3, NULL);
+    // consumer subject filters cannot overlap
+    testCond((s == NATS_ERR) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    test("filter: multiple non overlapping filters");
+    const char **filter7 = (const char *[]){"a.*","e.*"};
+    s = kvStore_KeysWithFilters(&l, kv, filter7, 2, NULL);
+    testCond((s == NATS_OK) && (l.Keys != NULL) && (l.Count == 3));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    // Delete the key and check if returned after filtering
+    test("Delete a.b:");
+    s = kvStore_Delete(kv, "a.b");
+    testCond(s == NATS_OK);
+
+    test("a.b should not be returned post deletion")
+    const char **filter8 = (const char *[]){"a.b"};
+    s = kvStore_KeysWithFilters(&l, kv, filter8, 1, NULL);
+    testCond((s == NATS_OK) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    // Purge the key and check if returned after filtering
+    test("Purge a.b:");
+    s = kvStore_Purge(kv, "a.d", NULL);
+    testCond(s == NATS_OK);
+
+    test("a.d should not be returned post purge")
+    const char **filter9 = (const char *[]){"a.d"};
+    s = kvStore_KeysWithFilters(&l, kv, filter9, 1, NULL);
+    testCond((s == NATS_OK) && (l.Keys == NULL) && (l.Count == 0));
+    nats_clearLastError();
+    kvKeysList_Destroy(&l);
+
+    kvStore_Destroy(kv);
+
+    JS_TEARDOWN;
+}
+
 void test_KeyValueDeleteVsPurge(void)
 {
     natsStatus          s;
@@ -32910,10 +33876,6 @@ void test_MicroGroups(void)
     microServiceInfo *info = NULL;
     int i;
 
-    microEndpointConfig ep1_cfg = {
-        .Name = "ep1",
-        .Handler = _microHandleRequest42,
-    };
     microEndpointConfig ep2_cfg = {
         .Name = "ep2",
         .Handler = _microHandleRequest42,
@@ -32951,16 +33913,19 @@ void test_MicroGroups(void)
     _startMicroservice(&m, nc, &cfg, NULL, 0, &arg);
 
     test("AddEndpoint 1 to service: ");
+    microEndpointConfig ep1_cfg = { .Name = "ep1", .Handler = _microHandleRequest42 };
     testCond(NULL == microService_AddEndpoint(m, &ep1_cfg));
 
     test("AddGroup g1: ");
-    testCond(NULL == microService_AddGroup(&g1, m, "g1"));
+    microGroupConfig g1_cfg = { .Prefix = "g1" };
+    testCond(NULL == microService_AddGroup(&g1, m, &g1_cfg));
 
     test("AddEndpoint 1 to g1: ");
     testCond(NULL == microGroup_AddEndpoint(g1, &ep1_cfg));
 
     test("Add sub-Group g2: ");
-    testCond(NULL == microGroup_AddGroup(&g2, g1, "g2"));
+    microGroupConfig g2_cfg = { .Prefix = "g2" };
+    testCond(NULL == microGroup_AddGroup(&g2, g1, &g2_cfg));
 
     test("AddEndpoint 1 to g2: ");
     testCond(NULL == microGroup_AddEndpoint(g2, &ep1_cfg));
@@ -33000,6 +33965,118 @@ void test_MicroGroups(void)
 
     natsOptions_Destroy(opts);
     _destroyDefaultThreadArgs(&arg);
+    _stopServer(serverPid);
+}
+
+void test_MicroQueueGroupForEndpoint(void)
+{
+    microError *err = NULL;
+    natsPid serverPid = NATS_INVALID_PID;
+    natsOptions *opts = NULL;
+    natsConnection *nc = NULL;
+
+    microServiceConfig serviceConfig = { .Name = "testService", .Version = "1.0.0" };
+    microGroupConfig group1Config = { .Prefix = "testGroup1" };
+    microGroupConfig group2Config = { .Prefix = "testGroup2" };
+    microEndpointConfig epConfig = { .Name = "testEP", .Handler = _microHandleRequest42 };
+
+    typedef struct {
+        const char *name;
+
+        bool serviceNoQueueGroup;
+        const char *serviceQueueGroup;
+        bool group1NoQueueGroup;
+        const char *group1QueueGroup;
+        bool group2NoQueueGroup;
+        const char *group2QueueGroup;
+        bool epNoQueueGroup;
+        const char *epQueueGroup;
+
+        const char *expectedServiceLevel;
+        const char *expectedGroup1Level;
+        const char *expectedGroup2Level;
+    } TC;
+    TC tcs[] = {
+        {.name="default",
+            .expectedServiceLevel=MICRO_DEFAULT_QUEUE_GROUP, .expectedGroup1Level=MICRO_DEFAULT_QUEUE_GROUP, .expectedGroup2Level=MICRO_DEFAULT_QUEUE_GROUP},
+        {.name="service value override", .serviceQueueGroup="test",
+            .expectedServiceLevel="test", .expectedGroup1Level="test", .expectedGroup2Level="test"},
+        {.name="G1 value override", .group1QueueGroup="G1",
+            .expectedServiceLevel=MICRO_DEFAULT_QUEUE_GROUP, .expectedGroup1Level="G1", .expectedGroup2Level="G1"},
+        {.name="service and G1 value overrides", .serviceQueueGroup="S", .group1QueueGroup="G1",
+            .expectedServiceLevel="S", .expectedGroup1Level="G1", .expectedGroup2Level="G1"},
+        {.name="service and G2 value overrides", .serviceQueueGroup="S", .group2QueueGroup="G2",
+            .expectedServiceLevel="S", .expectedGroup1Level="S", .expectedGroup2Level="G2"},
+        {.name="disabled", .serviceNoQueueGroup=true,
+            .expectedServiceLevel=NULL, .expectedGroup1Level=NULL, .expectedGroup2Level=NULL},
+        {.name="disabled for S, set for G1", .serviceNoQueueGroup=true, .group1QueueGroup="G1",
+            .expectedServiceLevel=NULL, .expectedGroup1Level="G1", .expectedGroup2Level="G1"},
+        {.name="disabled for G1", .group1NoQueueGroup=true,
+            .expectedServiceLevel=MICRO_DEFAULT_QUEUE_GROUP, .expectedGroup1Level=NULL, .expectedGroup2Level=NULL},
+        {.name="disabled for G1, set for G2", .group1NoQueueGroup=true, .group2QueueGroup="G2",
+            .expectedServiceLevel=MICRO_DEFAULT_QUEUE_GROUP, .expectedGroup1Level=NULL, .expectedGroup2Level="G2"},
+    };
+
+    serverPid = _startServer("nats://127.0.0.1:4222", NULL, true);
+    CHECK_SERVER_STARTED(serverPid);
+
+    test("Connect to server: ");
+    testCond(NATS_OK == natsConnection_Connect(&nc, opts));
+
+    for (int i = 0; i < (int)(sizeof(tcs) / sizeof(tcs[0])); i++)
+    {
+        TC tc = tcs[i];
+        struct threadArg arg;
+        microService *service = NULL;
+        microGroup *group1 = NULL, *group2 = NULL;
+        microServiceInfo *info = NULL;
+        microServiceStats *stats = NULL;
+
+        if(_createDefaultThreadArgsForCbTests(&arg) != NATS_OK)
+            FAIL("Unable to setup test args");
+
+        testf("%s: ", tc.name);
+
+        serviceConfig.NoQueueGroup = tc.serviceNoQueueGroup;
+        serviceConfig.QueueGroup = tc.serviceQueueGroup;
+        epConfig.NoQueueGroup = tc.epNoQueueGroup;
+        epConfig.QueueGroup = tc.epQueueGroup;
+        group1Config.NoQueueGroup = tc.group1NoQueueGroup;
+        group1Config.QueueGroup = tc.group1QueueGroup;
+        group2Config.NoQueueGroup = tc.group2NoQueueGroup;
+        group2Config.QueueGroup = tc.group2QueueGroup;
+
+        err = _startMicroservice(&service, nc, &serviceConfig, NULL, 0, &arg);
+        MICRO_CALL(err, microService_AddEndpoint(service, &epConfig));
+        MICRO_CALL(err, microService_AddGroup(&group1, service, &group1Config));
+        MICRO_CALL(err, microGroup_AddEndpoint(group1, &epConfig));
+        MICRO_CALL(err, microGroup_AddGroup(&group2, group1, &group2Config));
+        MICRO_CALL(err, microGroup_AddEndpoint(group2, &epConfig));
+        MICRO_CALL(err, microService_GetInfo(&info, service));
+        MICRO_CALL(err, microService_GetStats(&stats, service));
+
+#define _testQueueGroup(_expected, _actual) \
+        (_expected) == NULL ? (_actual) == NULL : strcmp((_expected), (_actual)) == 0
+
+        testCond((err == NULL) && 
+            (info != NULL) && (info->EndpointsLen == 3) &&
+            (stats != NULL) && (stats->EndpointsLen == 3) &&
+            (_testQueueGroup(tc.expectedServiceLevel, info->Endpoints[0].QueueGroup)) &&
+            (_testQueueGroup(tc.expectedServiceLevel, stats->Endpoints[0].QueueGroup)) &&
+            (_testQueueGroup(tc.expectedGroup1Level, stats->Endpoints[1].QueueGroup)) &&
+            (_testQueueGroup(tc.expectedGroup1Level, info->Endpoints[1].QueueGroup)) &&
+            (_testQueueGroup(tc.expectedGroup2Level, info->Endpoints[2].QueueGroup)) &&
+            (_testQueueGroup(tc.expectedGroup2Level, stats->Endpoints[2].QueueGroup)));
+
+        microService_Destroy(service);
+        _waitForMicroservicesAllDone(&arg);
+        microServiceInfo_Destroy(info);
+        microServiceStats_Destroy(stats);
+        _destroyDefaultThreadArgs(&arg);
+    }
+
+    natsConnection_Destroy(nc);
+    natsOptions_Destroy(opts);
     _stopServer(serverPid);
 }
 
@@ -33161,6 +34238,7 @@ void test_MicroBasics(void)
         testCond(
             (NATS_OK == nats_JSONGetStrPtr(array[0], "name", &str)) && (strcmp(str, "do") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(array[0], "subject", &str)) && (strcmp(str, "svc.do") == 0)
+            && (NATS_OK == nats_JSONGetStrPtr(array[0], "queue_group", &str)) && (strcmp(str, MICRO_DEFAULT_QUEUE_GROUP) == 0)
             && (NATS_OK == nats_JSONGetObject(array[0], "metadata", &md)) && (md == NULL)
         );
 
@@ -33169,6 +34247,7 @@ void test_MicroBasics(void)
         testCond(
             (NATS_OK == nats_JSONGetStrPtr(array[1], "name", &str)) && (strcmp(str, "unused") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(array[1], "subject", &str)) && (strcmp(str, "svc.unused") == 0)
+            && (NATS_OK == nats_JSONGetStrPtr(array[0], "queue_group", &str)) && (strcmp(str, MICRO_DEFAULT_QUEUE_GROUP) == 0)
             && (NATS_OK == nats_JSONGetObject(array[1], "metadata", &md))
             && (NATS_OK == nats_JSONGetStrPtr(md, "key1", &str)) && (strcmp(str, "value1") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(md, "key2", &str)) && (strcmp(str, "value2") == 0)
@@ -33468,8 +34547,8 @@ void test_MicroServiceStopsWhenServerStops(void)
     natsMutex_Lock(arg.m);
     while ((s != NATS_TIMEOUT) && !arg.microAllDone)
         s = natsCondition_TimedWait(arg.c, arg.m, 1000);
-    natsMutex_Unlock(arg.m);
     testCond(arg.microAllDone);
+    natsMutex_Unlock(arg.m);
 
     test("Test microservice is not running: ");
     testCond(microService_IsStopped(m))
@@ -35598,7 +36677,7 @@ _subDlvThreadPooled(natsSubscription *sub)
 {
     bool pooled;
     natsSub_Lock(sub);
-    pooled = (sub->dispatcher->dedicatedTo == NULL);
+    pooled = (sub->dispatcher->ownedBy == NULL);
     natsSub_Unlock(sub);
     return pooled;
 }

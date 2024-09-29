@@ -1206,6 +1206,41 @@ typedef struct jsFetchRequest
 
 } jsFetchRequest;
 
+/** \brief Callback used to indicate that the work of js_PullSubscribeAsync is
+ * done.
+ *
+ * @param nc - Connection to the NATS server
+ * @param sub - Subscription being used
+ * @param s - Completion status code
+ * - `NATS_OK` - should never happen here!
+ * - `NATS_TIMEOUT` indicates that the fetch has reached its lifetime expiration
+ *   time, or had NoWait set and there are no more messages.
+ * - `NATS_NOT_FOUND` is returned when the server has no messages to deliver at
+ *   the beginning of a specific request. It may be returned for NoWait
+ *   subscriptions, effectively the same meaning as NATS_TIMEOUT - early
+ *   termination for NoWait.
+ * - `NATS_MAX_DELIVERED_MSGS` indicates that lifetime `Batch` message limit has
+ *   been reached.
+ * - `NATS_LIMIT_REACHED` is returned when the lifetime byte limit is reached.
+ * - Other status values represent error conditions.
+ * @param closure completeClosure that was passed to js_PullSubscribeAsync
+ *
+ * @see js_PullSubscribeAsync
+ */
+typedef void (*natsFetchCompleteHandler)(natsConnection *nc, natsSubscription *sub, natsStatus s, void *closure);
+
+/** \brief Callback used to customize flow control for js_PullSubscribeAsync.
+ *
+ * The library will invoke this callback when it may be time to request more
+ * messages from the server.
+ *
+ * @return true to fetch more, false to skip. If true, @messages and @maxBytes
+ * should be set to the number of messages and max bytes to fetch.
+ *
+ * @see js_PullSubscribeAsync
+ */
+typedef bool (*natsFetchNextHandler)(int *messages, int64_t *bytes, natsSubscription *sub, void *closure);
+
 /**
  * JetStream context options.
  *
@@ -1242,6 +1277,51 @@ typedef struct jsOptions
                 int64_t                 StallWait;              ///< Amount of time (in milliseconds) to wait in a PublishAsync call when there is MaxPending inflight messages, default is 200 ms.
 
         } PublishAsync;
+
+        struct jsOptionsPullSubscribeAsync
+        {
+                // Lifetime of the subscription (completes when any one of the
+                // targets is reached).
+                int64_t                 Timeout; // in milliseconds
+                int                     MaxMessages;
+                int64_t                 MaxBytes;
+
+                // If NoWait is set, the subscription will receive the messages
+                // already stored on the server subject to the limits, but will
+                // not wait for more messages.
+                //
+                // Note that if Timeout is set we would still wait for first
+                // message to become available, even if there are currently any
+                // on the server
+                bool                    NoWait;
+
+                // Fetch complete handler that receives the exit status code,
+                // the subscription's Complete handler is also invoked, but does
+                // not have the status code.
+                natsFetchCompleteHandler CompleteHandler;
+                void                    *CompleteHandlerClosure;
+
+                // Have server sends heartbeats at this interval to help detect
+                // communication failures.
+                int64_t                 Heartbeat; // in milliseconds
+
+                // Options to control automatic Fetch flow control. The number
+                // of messages to ask for in a single request, and if we should
+                // try to fetch ahead, KeepAhead more than we need to finish the
+                // current request. Fetch this many messages ahead of time.
+                //
+                // KeepAhead can not be used in conjunction with MaxBytes or
+                // NoWait.
+                int                     FetchSize;
+                int                     KeepAhead;
+
+                // Manual fetch flow control. If provided gets called before
+                // each message is deliverered to msgCB, and overrides the
+                // default algorithm for sending Next requests.
+                natsFetchNextHandler    NextHandler;
+                void                    *NextHandlerClosure;
+
+        } PullSubscribeAsync;
 
         /**
          * Advanced stream options
@@ -6519,6 +6599,34 @@ natsSubscription_Fetch(natsMsgList *list, natsSubscription *sub, int batch, int6
 NATS_EXTERN natsStatus
 jsFetchRequest_Init(jsFetchRequest *request);
 
+/** \brief Starts a Pull based JetStream subscription, and delivers messages to
+ * a user callback asynchronously.
+ *
+ * The subscription can be set up to run indefinitely, and issue pull requests
+ * as needed, or it can be set up to auto-terminate when certain conditions
+ * (like max messages, or a time-based expiration) are met. `lifetime` is used
+ * to control the basic limits, and whether to use server Heartbeats to detect
+ * connection failures. jsOpts->PullSubscribeAsync is used to control the pulling
+ * parameters, provide extra event callbacks and hooks, and to tune the handling
+ * of missing heartbets.
+ *
+ * @param newsub the location where to store the pointer to the newly created
+ * #natsSubscription object.
+ * @param js the pointer to the #jsCtx object.
+ * @param subject the subject this subscription is created for.
+ * @param durable the optional durable name.
+ * @param msgCB the #natsMsgHandler callback.
+ * @param msgCBClosure a pointer to an user defined object (can be `NULL`).
+ * @param jsOpts the pointer to the #jsOptions object, possibly `NULL`.
+ * @param opts the subscribe options, possibly `NULL`.
+ * @param errCode the location where to store the JetStream specific error code,
+ * or `NULL` if not needed.
+ */
+NATS_EXTERN natsStatus
+js_PullSubscribeAsync(natsSubscription **newsub, jsCtx *js, const char *subject, const char *durable,
+                      natsMsgHandler msgCB, void *msgCBClosure,
+                      jsOptions *jsOpts, jsSubOptions *opts, jsErrCode *errCode);
+
 /** \brief Fetches messages for a pull subscription with a complete request configuration
  *
  * Similar to #natsSubscription_Fetch but a full #jsFetchRequest configuration is provided
@@ -7172,6 +7280,32 @@ kvStore_WatchAll(kvWatcher **new_watcher, kvStore *kv, kvWatchOptions *opts);
 NATS_EXTERN natsStatus
 kvStore_Keys(kvKeysList *list, kvStore *kv, kvWatchOptions *opts);
 
+/** \brief Returns all keys in the bucket which matches the list of subject like filters.
+ *
+ * Get a list of the keys in a bucket filtered by a
+ * subject-like string, for instance "key" or "key.foo.*" or "key.>"
+ * Any deleted or purged keys will not be returned.
+ *
+ * \note Use #kvWatchOptions.Timeout to specify how long to wait (in milliseconds)
+ * to gather all keys for this bucket. If the deadline is reached, this function
+ * will return #NATS_TIMEOUT and no keys.
+ *
+ * \warning The user should call #kvKeysList_Destroy to release memory allocated
+ * for the entries list.
+ *
+ * @see kvWatchOptions_Init
+ * @see kvKeysList_Destroy
+ * @see kvStore_WatchMulti
+ *
+ * @param list the pointer to a #kvKeysList that will be initialized and filled with resulting key strings.
+ * @param kv the pointer to the #kvStore object.
+ * @param filters the list of subject filters. Cannot be `NULL`.
+ * @param numFilters number of filters. Cannot be 0.
+ * @param opts the history options, possibly `NULL`.
+ */
+NATS_EXTERN natsStatus
+kvStore_KeysWithFilters(kvKeysList *list, kvStore *kv, const char **filters, int numFilters, kvWatchOptions *opts);
+
 /** \brief Destroys this list of KeyValue store key strings.
  *
  * This function iterates through the list of all key strings and free them.
@@ -7502,6 +7636,14 @@ typedef struct micro_error_s microError;
 typedef struct micro_group_s microGroup;
 
 /**
+ * @brief The Microservice endpoint *group* configuration object.
+ *
+ * @see micro_group_config_s for descriptions of the fields,
+ * micro_service_config_s, micro_service_config_s, microService_AddGroup
+ */
+typedef struct micro_group_config_s microGroupConfig;
+
+/**
  * @brief a request received by a microservice endpoint.
  *
  * @see micro_request_s for descriptions of the fields.
@@ -7647,7 +7789,19 @@ struct micro_endpoint_config_s
     const char *Subject;
 
     /**
-     * @briefMetadata for the endpoint, a JSON-encoded user-provided object,
+     * @brief Overrides the default queue group for the service.
+     *
+     */
+    const char *QueueGroup;
+
+    /**
+     * @brief Disables the use of a queue group for the service.
+     *
+     */
+    bool NoQueueGroup;
+
+    /**
+     * @brief Metadata for the endpoint, a JSON-encoded user-provided object,
      * e.g. `{"key":"value"}`
      */
     natsMetadata Metadata;
@@ -7680,6 +7834,12 @@ struct micro_endpoint_info_s
     const char *Subject;
 
     /**
+     * @brief Endpoint's actual queue group (the default "q", or one explicitly
+     * set by the user), or omitted if NoQueueGroup was applied.
+     */
+    const char *QueueGroup;
+
+    /**
      * @briefMetadata for the endpoint, a JSON-encoded user-provided object,
      * e.g. `{"key":"value"}`
      */
@@ -7693,6 +7853,12 @@ struct micro_endpoint_stats_s
 {
     const char *Name;
     const char *Subject;
+
+    /**
+     * @brief Endpoint's actual queue group (the default "q", or one explicitly
+     * set by the user), or omitted if NoQueueGroup was applied.
+     */
+    const char *QueueGroup;
 
     /**
      * @brief The number of requests received by the endpoint.
@@ -7727,6 +7893,29 @@ struct micro_endpoint_stats_s
 };
 
 /**
+ * #brief The Microservice endpoint *group* configuration object.
+ */
+struct micro_group_config_s
+{
+    /**
+     * @brief The subject prefix for the group.
+     */
+    const char *Prefix;
+
+    /**
+     * @brief Overrides the default queue group for the service.
+     *
+     */
+    const char *QueueGroup;
+
+    /**
+     * @brief Disables the use of a queue group for the service.
+     *
+     */
+    bool NoQueueGroup;
+};
+
+/**
  * @brief The Microservice top-level configuration object.
  *
  * The service is created with a clone of the config and all of its values, so
@@ -7752,7 +7941,20 @@ struct micro_service_config_s
     const char *Description;
 
     /**
-     * @brief Metadata for the service, a JSON-encoded user-provided object, e.g. `{"key":"value"}`
+     * @brief Overrides the default queue group for the service ("q").
+     *
+     */
+    const char *QueueGroup;
+
+    /**
+     * @brief Disables the use of a queue group for the service.
+     *
+     */
+    bool NoQueueGroup;
+
+    /**
+     * @brief Immutable metadata for the service, a JSON-encoded user-provided
+     * object, e.g. `{"key":"value"}`
      */
     natsMetadata Metadata;
 
@@ -8013,15 +8215,14 @@ microService_AddEndpoint(microService *m, microEndpointConfig *config);
  * @param new_group the location where to store the pointer to the new
  * #microGroup object.
  * @param m the #microService that the group will be added to.
- * @param prefix a prefix to use on names and subjects of all endpoints in the
- * group.
+ * @param config group parameters.
  *
  * @return a #microError if an error occurred.
  *
  * @see #microGroup_AddGroup, #microGroup_AddEndpoint
  */
 NATS_EXTERN microError *
-microService_AddGroup(microGroup **new_group, microService *m, const char *prefix);
+microService_AddGroup(microGroup **new_group, microService *m, microGroupConfig *config);
 
 /** @brief Destroys a microservice, stopping it first if needed.
  *
@@ -8149,15 +8350,14 @@ NATS_EXTERN microError *microService_Stop(microService *m);
  * @param new_group the location where to store the pointer to the new
  * #microGroup object.
  * @param parent the #microGroup that the new group will be added to.
- * @param prefix a prefix to use on names and subjects of all endpoints in the
- * group.
+ * @param config group parameters.
  *
  * @return a #microError if an error occurred.
  *
  * @see #microGroup_AddGroup, #microGroup_AddEndpoint
  */
 NATS_EXTERN microError *
-microGroup_AddGroup(microGroup **new_group, microGroup *parent, const char *prefix);
+microGroup_AddGroup(microGroup **new_group, microGroup *parent, microGroupConfig *config);
 
 /** @brief Adds an endpoint to a #microGroup and starts listening for messages.
  *
