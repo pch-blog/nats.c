@@ -160,7 +160,7 @@ struct threadArg
 
     int              attached;
     int              detached;
-    bool             evStop;
+
     bool             doRead;
     bool             doWrite;
 
@@ -4759,10 +4759,11 @@ void test_natsGetJWTOrSeed(void)
     char        buf[256];
     const char  *valids[] = {
         "--- START JWT ---\nsome value\n--- END JWT ---\n",
+        "\r\n\r\n--- START JWT ---\r\nsome value\r\n--- END JWT ---\r\n",
         "--- ---\nsome value\n--- ---\n",
         "------\nsome value\n------\n",
         "---\nabc\n--\n---START---\nsome value\n---END---\n----\ndef\n--- ---\n",
-        "nothing first\nthen it starts\n  --- START ---\nsome value\n--- END ---\n---START---\nof something else\n---END---\n",
+        "nothing first\nthen it starts\n\r\n  --- START ---\r\n\n\n\r\nsome value\n--- END ---\n\n---START---\nof something else\n---END---\n",
         "--- START ---\nsome value\n\n\n--- END ---\n",
     };
     const char *invalids[] = {
@@ -20229,6 +20230,11 @@ _evLoopRead(void *userData, bool add)
 
     natsMutex_Lock(arg->m);
     arg->doRead = add;
+    if (!add)
+    {
+        arg->closed = true;
+        arg->sock = NATS_SOCK_INVALID;
+    }
     natsCondition_Broadcast(arg->c);
     natsMutex_Unlock(arg->m);
 
@@ -20265,30 +20271,48 @@ static void
 _eventLoop(void *closure)
 {
     struct threadArg *arg = (struct threadArg *) closure;
-    natsSock         sock = NATS_SOCK_INVALID;
     natsConnection   *nc  = NULL;
     bool             read = false;
     bool             write= false;
     bool             stop = false;
+    bool             close= false;
+    natsSockCtx      ctx;
+
+    natsSock_Init(&ctx);
 
     while (!stop)
     {
-        nats_Sleep(100);
         natsMutex_Lock(arg->m);
-        while (!arg->evStop && ((sock = arg->sock) == NATS_SOCK_INVALID))
+        while (!arg->done && !arg->closed && (arg->sock == NATS_SOCK_INVALID))
             natsCondition_Wait(arg->c, arg->m);
-        stop = arg->evStop;
+        stop = arg->done;
         nc = arg->nc;
         read = arg->doRead;
         write = arg->doWrite;
+        close = arg->closed;
+        arg->closed = false;
+        if ((ctx.fd == NATS_SOCK_INVALID) && (arg->sock != NATS_SOCK_INVALID))
+            ctx.fd = arg->sock;
         natsMutex_Unlock(arg->m);
 
         if (!stop)
         {
             if (read)
-                natsConnection_ProcessReadEvent(nc);
+            {
+                natsStatus  s;
+
+                natsSock_InitDeadline(&ctx, 50);
+                s = natsSock_WaitReady(WAIT_FOR_READ, &ctx);
+                if (s == NATS_OK)
+                    natsConnection_ProcessReadEvent(nc);
+            }
             if (write)
                 natsConnection_ProcessWriteEvent(nc);
+            if (close)
+            {
+                natsConnection_ProcessCloseEvent(&ctx.fd);
+                close = false;
+            }
         }
     }
 }
@@ -20354,6 +20378,7 @@ void test_EventLoop(void)
     natsMutex_Lock(arg.m);
     while ((s != NATS_TIMEOUT) && !arg.reconnected)
         s = natsCondition_TimedWait(arg.c, arg.m, 2000);
+    arg.reconnected = false;
     natsMutex_Unlock(arg.m);
     testCond(s == NATS_OK);
 
@@ -20365,6 +20390,29 @@ void test_EventLoop(void)
     s = natsSubscription_NextMsg(&msg, sub, 1000);
     testCond(s == NATS_OK);
     natsMsg_Destroy(msg);
+    msg = NULL;
+
+    test("Explicit reconnect: ");
+    s = natsConnection_Reconnect(nc);
+    testCond(s == NATS_OK);
+
+    test("Wait for reconnect: ");
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && !arg.reconnected)
+        s = natsCondition_TimedWait(arg.c, arg.m, 2000);
+    arg.reconnected = false;
+    natsMutex_Unlock(arg.m);
+    testCond(s == NATS_OK);
+
+    test("Publish: ");
+    s = natsConnection_PublishString(nc, "foo", "bar");
+    testCond(s == NATS_OK);
+
+    test("Check msg received: ");
+    s = natsSubscription_NextMsg(&msg, sub, 1000);
+    testCond(s == NATS_OK);
+    natsMsg_Destroy(msg);
+    msg = NULL;
 
     test("Close and wait for close cb: ");
     natsConnection_Close(nc);
@@ -20372,7 +20420,7 @@ void test_EventLoop(void)
     testCond(s == NATS_OK);
 
     natsMutex_Lock(arg.m);
-    arg.evStop = true;
+    arg.done = true;
     natsCondition_Broadcast(arg.c);
     natsMutex_Unlock(arg.m);
 
@@ -20381,7 +20429,7 @@ void test_EventLoop(void)
 
     test("Check ev loop: ");
     natsMutex_Lock(arg.m);
-    if (arg.attached != 2 || !arg.detached)
+    if (arg.attached != 3 || !arg.detached || (arg.sock != NATS_SOCK_INVALID))
         s = NATS_ERR;
     natsMutex_Unlock(arg.m);
     testCond(s == NATS_OK);
@@ -20466,7 +20514,7 @@ void test_EventLoopRetryOnFailedConnect(void)
     testCond(s == NATS_OK);
 
     natsMutex_Lock(arg.m);
-    arg.evStop = true;
+    arg.done = true;
     natsCondition_Broadcast(arg.c);
     natsMutex_Unlock(arg.m);
 
@@ -20510,7 +20558,7 @@ void test_EventLoopTLS(void)
     testCond(s == NATS_OK);
 
     test("Start server: ");
-    pid = _startServer("nats://127.0.0.1:4443", "-config tls.conf -DV", true);
+    pid = _startServer("nats://127.0.0.1:4443", "-config tls.conf", true);
     CHECK_SERVER_STARTED(pid);
     testCond(s == NATS_OK);
 
@@ -20543,21 +20591,34 @@ void test_EventLoopTLS(void)
     natsMutex_Lock(arg.m);
     while ((s != NATS_TIMEOUT) && !arg.reconnected)
         s = natsCondition_TimedWait(arg.c, arg.m, 2000);
+    arg.reconnected = false;
     natsMutex_Unlock(arg.m);
     testCond(s == NATS_OK);
 
-    test("Shutdown evLoop: ");
+    test("Explicit reconnect: ");
+    s = natsConnection_Reconnect(nc);
+    testCond(s == NATS_OK);
+
+    test("Wait for reconnect: ");
     natsMutex_Lock(arg.m);
-    arg.evStop = true;
-    natsCondition_Broadcast(arg.c);
+    while ((s != NATS_TIMEOUT) && !arg.reconnected)
+        s = natsCondition_TimedWait(arg.c, arg.m, 2000);
+    arg.reconnected = false;
     natsMutex_Unlock(arg.m);
-    natsThread_Join(arg.t);
-    natsThread_Destroy(arg.t);
     testCond(s == NATS_OK);
 
     test("Close and wait for close cb: ");
     natsConnection_Close(nc);
     s = _waitForConnClosed(&arg);
+    testCond(s == NATS_OK);
+
+    test("Shutdown evLoop: ");
+    natsMutex_Lock(arg.m);
+    arg.done = true;
+    natsCondition_Broadcast(arg.c);
+    natsMutex_Unlock(arg.m);
+    natsThread_Join(arg.t);
+    natsThread_Destroy(arg.t);
     testCond(s == NATS_OK);
 
     natsConnection_Destroy(nc);
@@ -21400,7 +21461,7 @@ void test_SSLServerNameIndication(void)
     arg.control = 3;
 
     s = _startMockupServer(&sock, "localhost", "4222");
-    
+
     // Start the thread that will try to connect to our server...
     IFOK(s, natsThread_Create(&t, _connectToMockupServer, (void*) &arg));
 
@@ -21410,7 +21471,7 @@ void test_SSLServerNameIndication(void)
     {
         s = NATS_SYS_ERROR;
     }
-    
+
     testCond((s == NATS_OK) && (ctx.fd > 0));
 
     test("Read ClientHello from client: ");
@@ -32060,6 +32121,17 @@ void test_KeyValueWatch(void)
     natsThread_Join(t);
     natsThread_Destroy(t);
     kvWatcher_Destroy(w);
+    w = NULL;
+
+    // Now try with UpdatesOnly and make sure we don't get the initial values.
+    test("Create watcher with UpdatesOnly: ");
+    kvWatchOptions o = {.UpdatesOnly = true};
+    s = kvStore_Watch(&w, kv, "t.*", &o);
+    testCond(s == NATS_OK);
+
+    IFOK(s, kvStore_PutString(NULL, kv, "t.age", "57"));
+    testCond(_expectUpdate(w, "t.age", "57", 11));
+    kvWatcher_Destroy(w);
     kvStore_Destroy(kv);
 
     JS_TEARDOWN;
@@ -33560,7 +33632,7 @@ _startMicroservice(microService** new_m, natsConnection *nc, microServiceConfig 
 static void
 _startMicroserviceOK(microService** new_m, natsConnection *nc, microServiceConfig *cfg, microEndpointConfig **eps, int num_eps, struct threadArg *arg)
 {
-    char buf[64];
+    char buf[256];
 
     snprintf(buf, sizeof(buf), "Start microservice %s: ", cfg->Name);
     test(buf);
@@ -33575,45 +33647,44 @@ _startManyMicroservices(microService** svcs, int n, natsConnection *nc, microSer
 
     for (i = 0; i < n; i++)
     {
+        char buf[64];
+        cfg->Version = "1.0.0";
+        cfg->Description = "returns 42";
+
+        if (nats_IsStringEmpty(cfg->Name))
+        {
+            snprintf(buf, sizeof(buf), "CoolService-%d", i);
+            cfg->Name = buf;
+        }
         _startMicroserviceOK(&(svcs[i]), nc, cfg, eps, num_eps, arg);
     }
 
     testCond(true);
 }
 
-static void
-_waitForMicroservicesAllDone(struct threadArg *arg)
-{
-    natsStatus s = NATS_OK;
-
-    test("Wait for all microservices to stop: ");
-    natsMutex_Lock(arg->m);
-    while ((s != NATS_TIMEOUT) && !arg->microAllDone)
-        s = natsCondition_TimedWait(arg->c, arg->m, 1000);
-    natsMutex_Unlock(arg->m);
-    testCond((NATS_OK == s) && arg->microAllDone);
-
-    // `Done` may be immediately followed by freeing the service, so wait a bit
-    // to make sure it happens before the test exits.
-    nats_Sleep(20);
-}
-
-static void
-_destroyMicroservicesAndWaitForAllDone(microService** svcs, int n, struct threadArg *arg)
-{
-    char buf[64];
-
-    snprintf(buf, sizeof(buf), "Wait for all %d microservices to stop: ", n);
-    test(buf);
-
-    for (int i = 0; i < n; i++)
-    {
-        if (NULL != microService_Destroy(svcs[i]))
-            FAIL("Unable to destroy microservice!");
+#define _waitForMicroservicesAllDone(_arg)                                              \
+    {                                                                                   \
+        natsMutex_Lock((_arg)->m);                                                      \
+        testf("Wait for %d microservices to stop: ", (_arg)->microRunningServiceCount); \
+        natsStatus waitStatus = NATS_OK;                                                \
+        bool allDone = false;                                                           \
+        while ((waitStatus != NATS_TIMEOUT) && !(_arg)->microAllDone)                   \
+            waitStatus = natsCondition_TimedWait((_arg)->c, (_arg)->m, 1000);           \
+        allDone = (_arg)->microAllDone;                                                 \
+        natsMutex_Unlock((_arg)->m);                                                    \
+        testCond((NATS_OK == waitStatus) && allDone);                                   \
     }
 
-    _waitForMicroservicesAllDone(arg);
-}
+#define _destroyMicroservice(_s)                                                                  \
+    testf("Destroy microservice %s: ", (_s)->cfg->Name);                                          \
+    microError *_err = microService_Destroy(_s);                                                  \
+    if (_err != NULL)                                                                             \
+    {                                                                                             \
+        char _buf[256];                                                                           \
+        FAILf("Unable to destroy microservice: %s", microError_String(_err, _buf, sizeof(_buf))); \
+        microError_Destroy(_err);                                                                 \
+    }                                                                                             \
+    testCond(true);
 
 typedef struct
 {
@@ -33843,14 +33914,8 @@ void test_MicroAddService(void)
         }
 
         microServiceInfo_Destroy(info);
-
-        if (m != NULL)
-        {
-            snprintf(buf, sizeof(buf), "%s: Destroy service: %d", m->cfg->Name, m->refs);
-            test(buf);
-            testCond(NULL == microService_Destroy(m));
-            _waitForMicroservicesAllDone(&arg);
-        }
+        _destroyMicroservice(m);
+        _waitForMicroservicesAllDone(&arg);
     }
 
     test("Destroy the test connection: ");
@@ -33886,11 +33951,11 @@ void test_MicroGroups(void)
     };
 
     const char* expected_subjects[] = {
-        "ep1",
-        "g1.ep1",
-        "g1.g2.ep1",
-        "g1.g2.ep2",
         "g1.ep2",
+        "g1.g2.ep2",
+        "g1.g2.ep1",
+        "g1.ep1",
+        "ep1",
     };
     int expected_num_endpoints = sizeof(expected_subjects) / sizeof(expected_subjects[0]);
 
@@ -33940,7 +34005,7 @@ void test_MicroGroups(void)
     if (err != NULL)
         FAIL("failed to get service info!")
 
-    test("Verify number of endpoints: ");
+    testf("Verify number of endpoints %d is %d: ", info->EndpointsLen, expected_num_endpoints);
     testCond(info->EndpointsLen == expected_num_endpoints);
 
     test("Verify endpoint subjects: ");
@@ -33956,7 +34021,7 @@ void test_MicroGroups(void)
 
     microServiceInfo_Destroy(info);
 
-    microService_Destroy(m);
+    _destroyMicroservice(m);
     _waitForMicroservicesAllDone(&arg);
 
     test("Destroy the test connection: ");
@@ -34058,17 +34123,17 @@ void test_MicroQueueGroupForEndpoint(void)
 #define _testQueueGroup(_expected, _actual) \
         (_expected) == NULL ? (_actual) == NULL : strcmp((_expected), (_actual)) == 0
 
-        testCond((err == NULL) && 
+        testCond((err == NULL) &&
             (info != NULL) && (info->EndpointsLen == 3) &&
             (stats != NULL) && (stats->EndpointsLen == 3) &&
-            (_testQueueGroup(tc.expectedServiceLevel, info->Endpoints[0].QueueGroup)) &&
-            (_testQueueGroup(tc.expectedServiceLevel, stats->Endpoints[0].QueueGroup)) &&
+            (_testQueueGroup(tc.expectedServiceLevel, info->Endpoints[2].QueueGroup)) &&
+            (_testQueueGroup(tc.expectedServiceLevel, stats->Endpoints[2].QueueGroup)) &&
             (_testQueueGroup(tc.expectedGroup1Level, stats->Endpoints[1].QueueGroup)) &&
             (_testQueueGroup(tc.expectedGroup1Level, info->Endpoints[1].QueueGroup)) &&
-            (_testQueueGroup(tc.expectedGroup2Level, info->Endpoints[2].QueueGroup)) &&
-            (_testQueueGroup(tc.expectedGroup2Level, stats->Endpoints[2].QueueGroup)));
+            (_testQueueGroup(tc.expectedGroup2Level, info->Endpoints[0].QueueGroup)) &&
+            (_testQueueGroup(tc.expectedGroup2Level, stats->Endpoints[0].QueueGroup)));
 
-        microService_Destroy(service);
+        _destroyMicroservice(service);
         _waitForMicroservicesAllDone(&arg);
         microServiceInfo_Destroy(info);
         microServiceStats_Destroy(stats);
@@ -34112,13 +34177,11 @@ void test_MicroBasics(void)
         &ep2_cfg,
     };
     microServiceConfig cfg = {
-        .Version = "1.0.0",
-        .Name = "CoolService",
-        .Description = "returns 42",
         .Metadata = (natsMetadata){
             .List = (const char *[]){"skey1", "svalue1", "skey2", "svalue2"},
             .Count = 2,
         },
+        .Name = "ManyServicesSameName",
         .Endpoint = NULL,
         .State = NULL,
     };
@@ -34176,7 +34239,7 @@ void test_MicroBasics(void)
         test(buf);
         err = microService_GetInfo(&info, svcs[i]);
         testCond((err == NULL) &&
-                 (strcmp(info->Name, "CoolService") == 0) &&
+                 (strcmp(info->Name, "ManyServicesSameName") == 0) &&
                  (strlen(info->Id) > 0) &&
                  (strcmp(info->Description, "returns 42") == 0) &&
                  (strcmp(info->Version, "1.0.0") == 0) &&
@@ -34187,7 +34250,7 @@ void test_MicroBasics(void)
     // Make sure we can request valid info with $SRV.INFO request.
     test("Create INFO inbox: ");
     testCond(NATS_OK == natsInbox_Create(&inbox));
-    micro_new_control_subject(&subject, MICRO_INFO_VERB, "CoolService", NULL);
+    micro_new_control_subject(&subject, MICRO_INFO_VERB, "ManyServicesSameName", NULL);
     test("Subscribe to INFO inbox: ");
     testCond(NATS_OK == natsConnection_SubscribeSync(&sub, nc, inbox));
     test("Publish INFO request: ");
@@ -34213,7 +34276,7 @@ void test_MicroBasics(void)
         snprintf(buf, sizeof(buf), "Validate INFO response strings#%d: ", i);
         test(buf);
         testCond(
-            (NATS_OK == nats_JSONGetStrPtr(js, "name", &str)) && (strcmp(str, "CoolService") == 0)
+            (NATS_OK == nats_JSONGetStrPtr(js, "name", &str)) && (strcmp(str, "ManyServicesSameName") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(js, "description", &str)) && (strcmp(str, "returns 42") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(js, "version", &str)) && (strcmp(str, "1.0.0") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(js, "id", &str)) && (strlen(str) > 0)
@@ -34233,25 +34296,25 @@ void test_MicroBasics(void)
         s = nats_JSONGetArrayObject(js, "endpoints", &array, &array_len);
         testCond((NATS_OK == s) && (array != NULL) && (array_len == 2));
 
-        test("Validate INFO svc.do endpoint: ");
-        md = NULL;
-        testCond(
-            (NATS_OK == nats_JSONGetStrPtr(array[0], "name", &str)) && (strcmp(str, "do") == 0)
-            && (NATS_OK == nats_JSONGetStrPtr(array[0], "subject", &str)) && (strcmp(str, "svc.do") == 0)
-            && (NATS_OK == nats_JSONGetStrPtr(array[0], "queue_group", &str)) && (strcmp(str, MICRO_DEFAULT_QUEUE_GROUP) == 0)
-            && (NATS_OK == nats_JSONGetObject(array[0], "metadata", &md)) && (md == NULL)
-        );
-
         test("Validate INFO unused endpoint with metadata: ");
         md = NULL;
         testCond(
-            (NATS_OK == nats_JSONGetStrPtr(array[1], "name", &str)) && (strcmp(str, "unused") == 0)
-            && (NATS_OK == nats_JSONGetStrPtr(array[1], "subject", &str)) && (strcmp(str, "svc.unused") == 0)
+            (NATS_OK == nats_JSONGetStrPtr(array[0], "name", &str)) && (strcmp(str, "unused") == 0)
+            && (NATS_OK == nats_JSONGetStrPtr(array[0], "subject", &str)) && (strcmp(str, "svc.unused") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(array[0], "queue_group", &str)) && (strcmp(str, MICRO_DEFAULT_QUEUE_GROUP) == 0)
-            && (NATS_OK == nats_JSONGetObject(array[1], "metadata", &md))
+            && (NATS_OK == nats_JSONGetObject(array[0], "metadata", &md))
             && (NATS_OK == nats_JSONGetStrPtr(md, "key1", &str)) && (strcmp(str, "value1") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(md, "key2", &str)) && (strcmp(str, "value2") == 0)
             && (NATS_OK == nats_JSONGetStrPtr(md, "key3", &str)) && (strcmp(str, "value3") == 0)
+        );
+
+        test("Validate INFO svc.do endpoint: ");
+        md = NULL;
+        testCond(
+            (NATS_OK == nats_JSONGetStrPtr(array[1], "name", &str)) && (strcmp(str, "do") == 0)
+            && (NATS_OK == nats_JSONGetStrPtr(array[1], "subject", &str)) && (strcmp(str, "svc.do") == 0)
+            && (NATS_OK == nats_JSONGetStrPtr(array[1], "queue_group", &str)) && (strcmp(str, MICRO_DEFAULT_QUEUE_GROUP) == 0)
+            && (NATS_OK == nats_JSONGetObject(array[1], "metadata", &md)) && (md == NULL)
         );
 
         nats_JSONDestroy(js);
@@ -34265,7 +34328,7 @@ void test_MicroBasics(void)
     // Make sure we can request SRV.PING.
     test("Create PING inbox: ");
     testCond(NATS_OK == natsInbox_Create(&inbox));
-    micro_new_control_subject(&subject, MICRO_PING_VERB, "CoolService", NULL);
+    micro_new_control_subject(&subject, MICRO_PING_VERB, "ManyServicesSameName", NULL);
     test("Subscribe to PING inbox: ");
     testCond(NATS_OK == natsConnection_SubscribeSync(&sub, nc, inbox));
     test("Publish PING request: ");
@@ -34287,7 +34350,7 @@ void test_MicroBasics(void)
         js = NULL;
         testCond((NATS_OK == nats_JSONParse(&js, reply->data, reply->dataLen)) &&
                  (NATS_OK == nats_JSONGetStrPtr(js, "name", &str)) &&
-                 (strcmp(str, "CoolService") == 0));
+                 (strcmp(str, "ManyServicesSameName") == 0));
         nats_JSONDestroy(js);
         natsMsg_Destroy(reply);
     }
@@ -34298,7 +34361,7 @@ void test_MicroBasics(void)
     // Get and validate $SRV.STATS from all service instances.
     test("Create STATS inbox: ");
     testCond(NATS_OK == natsInbox_Create(&inbox));
-    micro_new_control_subject(&subject, MICRO_STATS_VERB, "CoolService", NULL);
+    micro_new_control_subject(&subject, MICRO_STATS_VERB, "ManyServicesSameName", NULL);
     test("Subscribe to STATS inbox: ");
     testCond(NATS_OK == natsConnection_SubscribeSync(&sub, nc, inbox));
     test("Publish STATS request: ");
@@ -34330,13 +34393,13 @@ void test_MicroBasics(void)
 
         test("Ensure endpoint 0 has num_requests: ");
         n = 0;
-        s = nats_JSONGetInt(array[0], "num_requests", &n);
+        s = nats_JSONGetInt(array[1], "num_requests", &n);
         testCond(NATS_OK == s);
         num_requests += n;
 
         test("Ensure endpoint 0 has num_errors: ");
         n = 0;
-        s = nats_JSONGetInt(array[0], "num_errors", &n);
+        s = nats_JSONGetInt(array[1], "num_errors", &n);
         testCond(NATS_OK == s);
         num_errors += n;
 
@@ -34353,7 +34416,11 @@ void test_MicroBasics(void)
     natsInbox_Destroy(inbox);
     NATS_FREE(subject);
 
-    _destroyMicroservicesAndWaitForAllDone(svcs, NUM_MICRO_SERVICES, &arg);
+    for (i = 0; i < NUM_MICRO_SERVICES; i++)
+    {
+        _destroyMicroservice(svcs[i]);
+    }
+    _waitForMicroservicesAllDone(&arg);
 
     test("Destroy the test connection: ");
     natsConnection_Destroy(nc);
@@ -34378,9 +34445,6 @@ void test_MicroStartStop(void)
         .Handler = _microHandleRequest42,
     };
     microServiceConfig cfg = {
-        .Version = "1.0.0",
-        .Name = "CoolService",
-        .Description = "returns 42",
         .Endpoint = &ep_cfg,
     };
     natsMsg *reply = NULL;
@@ -34421,7 +34485,11 @@ void test_MicroStartStop(void)
     }
     testCond(NATS_OK == s);
 
-    _destroyMicroservicesAndWaitForAllDone(svcs, NUM_MICRO_SERVICES, &arg);
+    for (i = 0; i < NUM_MICRO_SERVICES; i++)
+    {
+        _destroyMicroservice(svcs[i]);
+    }
+    _waitForMicroservicesAllDone(&arg);
 
     test("Destroy the test connection: ");
     natsConnection_Destroy(nc);
@@ -34494,8 +34562,7 @@ void test_MicroServiceStopsOnClosedConn(void)
     test("Test microservice is stopped: ");
     testCond(microService_IsStopped(m));
 
-    test("Destroy microservice (final): ");
-    testCond(NULL == microService_Destroy(m))
+    _destroyMicroservice(m);
     _waitForMicroservicesAllDone(&arg);
 
     natsOptions_Destroy(opts);
@@ -34512,6 +34579,9 @@ void test_MicroServiceStopsWhenServerStops(void)
     natsPid serverPid = NATS_INVALID_PID;
     struct threadArg arg;
     microService *m = NULL;
+    microEndpointConfig ep_cfg = {
+        .Handler = _microHandleRequest42,
+    };
     microServiceConfig cfg = {
         .Name = "test",
         .Version = "1.0.0",
@@ -34537,24 +34607,35 @@ void test_MicroServiceStopsWhenServerStops(void)
 
     _startMicroservice(&m, nc, &cfg, NULL, 0, &arg);
 
+    const int numEndpoints = 50;
+    for (int i=0; i < numEndpoints; i++)
+    {
+        char buf[32];
+        testf("Add endpoint %d: ", i);
+        snprintf(buf, sizeof(buf), "do-%d", i);
+        ep_cfg.Subject = buf;
+        ep_cfg.Name = buf;
+        testCond(NULL == microService_AddEndpoint(m, &ep_cfg));
+    }
+
     test("Test microservice is running: ");
     testCond(!microService_IsStopped(m))
+
+    testf("Check that the service has %d endpoints: ", numEndpoints);
+    microServiceInfo *info = NULL;
+    microError *err = microService_GetInfo(&info, m);
+    testCond((err == NULL) && (info->EndpointsLen == numEndpoints));
+    microServiceInfo_Destroy(info);
 
     test("Stop the server: ");
     testCond((_stopServer(serverPid), true));
 
-    test("Wait for the service to stop: ");
-    natsMutex_Lock(arg.m);
-    while ((s != NATS_TIMEOUT) && !arg.microAllDone)
-        s = natsCondition_TimedWait(arg.c, arg.m, 1000);
-    testCond(arg.microAllDone);
-    natsMutex_Unlock(arg.m);
+    _waitForMicroservicesAllDone(&arg);
 
     test("Test microservice is not running: ");
     testCond(microService_IsStopped(m))
 
-    microService_Destroy(m);
-    _waitForMicroservicesAllDone(&arg);
+    _destroyMicroservice(m);
 
     test("Destroy the test connection: ");
     natsConnection_Destroy(nc);
@@ -34662,7 +34743,7 @@ void test_MicroAsyncErrorHandlerMaxPendingMsgs(void)
     testCond((s == NATS_OK) && arg.closed && (arg.status == NATS_SLOW_CONSUMER));
     natsMutex_Unlock(arg.m);
 
-    microService_Destroy(m);
+    _destroyMicroservice(m);
     _waitForMicroservicesAllDone(&arg);
 
     test("Destroy the test connection: ");
@@ -34744,7 +34825,7 @@ void test_MicroAsyncErrorHandlerMaxPendingBytes(void)
     natsMutex_Unlock(arg.m);
     testCond((s == NATS_OK) && arg.closed && (arg.status == NATS_SLOW_CONSUMER));
 
-    microService_Destroy(m);
+    _destroyMicroservice(m);
     _waitForMicroservicesAllDone(&arg);
 
     test("Destroy the test connection: ");

@@ -15,6 +15,8 @@
 
 static const char *usage = ""\
 "-gd            use global message delivery thread pool\n" \
+"-stream        stream name (required)\n" \
+"-durable       durable name (default is to create an ephemeral consumer)\n"
 "-sync          receive synchronously (default is asynchronous)\n" \
 "-pull          use pull subscription\n" \
 "-pull-async    use an async pull subscription\n" \
@@ -188,7 +190,7 @@ int main(int argc, char **argv)
             // Uncomment to provide custom control over next fetch size.
             // jsOpts.PullSubscribeAsync.NextHandler = nextFetchCb;
 
-            // Uncomment to turn off AutoACK on delivered messages.            
+            // Uncomment to turn off AutoACK on delivered messages.
             // so.ManualAck = true;
 
             s = js_PullSubscribeAsync(&sub, js, subj, durable, onMsg, NULL, &jsOpts, &so, &jerr);
